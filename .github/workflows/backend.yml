@@ -163,7 +163,7 @@ jobs:
             cd /home/spiderman/aicaller/dev
 
             # Write .env with exact versioned image tag
-            cat > .env << EOF
+            cat > docker/.env << EOF
             ENV=development
             IMAGE_TAG=${{ needs.version.outputs.image_tag }}
             DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
@@ -182,7 +182,7 @@ jobs:
 
             # Pull the exact versioned image
             echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-            docker compose -f docker/docker-compose.prod.yml pull api redis worker
+            docker compose -f docker/docker-compose.prod.yml pull api redis 
             docker compose -f docker/docker-compose.prod.yml up -d --remove-orphans traefik api redis
 
             # Health check
@@ -233,7 +233,7 @@ jobs:
             mkdir -p /home/spiderman/aicaller/prod
             cd /home/spiderman/aicaller/prod
 
-            cat > .env << EOF
+            cat > docker/.env << EOF
             ENV=production
             IMAGE_TAG=${{ needs.version.outputs.image_tag }}
             DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
@@ -251,7 +251,7 @@ jobs:
             EOF
 
             echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-            docker compose -f docker/docker-compose.prod.yml pull api redis worker
+            docker compose -f docker/docker-compose.prod.yml pull api redis
             docker compose -f docker/docker-compose.prod.yml up -d --remove-orphans traefik api redis
 
             sleep 15
