@@ -1,21 +1,23 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # docker-compose.dev.yml
 #
-# Development stack:
-#   - Traefik (reverse proxy + SSL)
-#   - FastAPI  (main API server)
-#   - Redis    (session store + Celery broker)
-#   - Worker   (Celery async task processor)
+# LOCAL DEVELOPMENT ONLY — never used on VM.
+# VM deployments always use docker-compose.prod.yml.
+#
+# Features:
+#   - Builds image locally from Dockerfile
+#   - Hot reload via --reload (code changes apply instantly)
+#   - Source code mounted so changes reflect without rebuild
+#   - Traefik dashboard exposed at http://localhost:8080
 #
 # Usage:
 #   docker compose -f docker/docker-compose.dev.yml up --build
-#
-# Traefik dashboard available at: http://localhost:8080
-# API available at:               http://localhost/  (port 80 via Traefik)
-# Direct API (bypass Traefik):    http://localhost:8000/
+#   docker compose -f docker/docker-compose.dev.yml up --build traefik api redis
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
+
+  # ── Traefik ────────────────────────────────────────────────────────────────
   traefik:
     image: traefik:v3.6.5
     container_name: aicaller_traefik_dev
@@ -34,12 +36,12 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"
+      - "8080:8080"     # Traefik dashboard
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/traefik.dev.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
-      - traefik_certs:/letsencrypt
+      - traefik_certs_dev:/letsencrypt
     networks:
       - aicaller_dev_net
     labels:
@@ -47,12 +49,15 @@ services:
       - "traefik.http.routers.dashboard.rule=Host(`traefik.localhost`)"
       - "traefik.http.routers.dashboard.service=api@internal"
 
+  # ── FastAPI ────────────────────────────────────────────────────────────────
   api:
+    # Builds from local Dockerfile — for local dev only
     build:
       context: ..
       dockerfile: Dockerfile
     container_name: aicaller_api_dev
     restart: unless-stopped
+    # Override CMD: use --reload for hot reload during development
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
@@ -60,6 +65,7 @@ services:
       --reload
       --reload-dir /app/app
     volumes:
+      # Mount source so file changes reflect instantly without rebuilding
       - ../app:/app/app:ro
     env_file:
       - ../.env
@@ -81,6 +87,7 @@ services:
         limits:
           memory: 512M
 
+  # ── Redis ──────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: aicaller_redis_dev
@@ -100,32 +107,33 @@ services:
         limits:
           memory: 256M
 
-  worker:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: aicaller_worker_dev
-    restart: unless-stopped
-    command: >
-      celery -A app.workers.celery_app worker
-      --loglevel=info
-      --concurrency=2
-    volumes:
-      - ../app:/app/app:ro
-    env_file:
-      - ../.env
-    environment:
-      - ENV=development
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - aicaller_dev_net
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+  # ── Celery Worker (Phase 3 — uncomment when pipeline is ready) ─────────────
+  # worker:
+  #   build:
+  #     context: ..
+  #     dockerfile: Dockerfile
+  #   container_name: aicaller_worker_dev
+  #   restart: unless-stopped
+  #   command: >
+  #     celery -A app.workers.celery_app worker
+  #     --loglevel=info
+  #     --concurrency=2
+  #   volumes:
+  #     - ../app:/app/app:ro
+  #   env_file:
+  #     - ../.env
+  #   environment:
+  #     - ENV=development
+  #     - REDIS_URL=redis://redis:6379/0
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - aicaller_dev_net
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 512M
 
 networks:
   aicaller_dev_net:
@@ -135,5 +143,5 @@ networks:
 volumes:
   redis_data_dev:
     name: aicaller_redis_data_dev
-  traefik_certs:
+  traefik_certs_dev:
     name: aicaller_traefik_certs_dev

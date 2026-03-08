@@ -1,0 +1,36 @@
+# GitVersion.yml
+# Controls how version numbers are calculated from git history
+#
+# develop branch → 1.0.0-dev.{commits}   e.g. 1.0.0-dev.5
+# main branch    → 1.0.0, 1.1.0          e.g. 1.0.0
+#
+# To bump version manually:
+#   patch: commit message contains +semver:patch  → 1.0.0 → 1.0.1
+#   minor: commit message contains +semver:minor  → 1.0.0 → 1.1.0
+#   major: commit message contains +semver:major  → 1.0.0 → 2.0.0
+
+assembly-versioning-scheme: MajorMinorPatch
+mode: ContinuousDelivery
+next-version: 1.0.0
+
+branches:
+  main:
+    regex: ^main$
+    tag: ""
+    increment: Patch
+    prevent-increment-of-merged-branch-version: true
+
+  develop:
+    regex: ^develop$
+    tag: dev
+    increment: Patch
+    track-merge-target: true
+
+  feature:
+    regex: ^feature/
+    tag: feature
+    increment: Inherit
+    source-branches: ["develop"]
+
+ignore:
+  sha: []
