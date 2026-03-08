@@ -1,0 +1,151 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.prod.yml
+#
+# VM DEPLOYMENT ONLY — never used locally.
+# For local dev use: docker-compose.dev.yml
+#
+# Deployed to: /home/spiderman/aicaller/prod/docker/
+# .env written here by GitHub Actions with IMAGE_TAG and all secrets.
+#
+# Services: Traefik + FastAPI + Redis
+# Worker: commented out until Phase 3
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Traefik ────────────────────────────────────────────────────────────────
+  # Owns ports 80 and 443 on the VM.
+  # Auto-discovers api container via Docker labels.
+  # Gets SSL cert from Let's Encrypt for API_DOMAIN automatically.
+  traefik:
+    image: traefik:v3.6.5
+    container_name: aicaller_traefik
+    restart: always
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=aicaller_net"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Redirect all HTTP → HTTPS
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Let's Encrypt — uses ACME_EMAIL from .env
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--api.dashboard=false"
+      - "--log.level=WARN"
+      - "--accesslog=true"
+      # Trust Cloudflare IPs so real client IPs are logged correctly
+      - "--entrypoints.websecure.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/letsencrypt
+    networks:
+      - aicaller_net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ── FastAPI ────────────────────────────────────────────────────────────────
+  # IMAGE_TAG injected by GitHub Actions via .env
+  # e.g. 1.0.0 / 1.0.1 / 1.1.0 etc.
+  api:
+    image: ${DOCKER_HUB_USERNAME}/aicaller-backend:${IMAGE_TAG}
+    container_name: aicaller_api
+    restart: always
+    environment:
+      - ENV=${ENV}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+      - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - aicaller_net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${API_DOMAIN}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+      - "traefik.http.services.api.loadbalancer.healthcheck.path=/health"
+      - "traefik.http.services.api.loadbalancer.healthcheck.interval=15s"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aicaller_redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - aicaller_net
+    # NOT exposed on host ports — only reachable within Docker network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ── Celery Worker — Phase 3 ────────────────────────────────────────────────
+  # Uncomment when STT→LLM→TTS pipeline is implemented
+  # worker:
+  #   image: ${DOCKER_HUB_USERNAME}/aicaller-backend:${IMAGE_TAG}
+  #   container_name: aicaller_worker
+  #   restart: always
+  #   command: >
+  #     celery -A app.workers.celery_app worker
+  #     --loglevel=warning
+  #     --concurrency=2
+  #   environment:
+  #     - ENV=${ENV}
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - SECRET_KEY=${SECRET_KEY}
+  #     - SUPABASE_URL=${SUPABASE_URL}
+  #     - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+  #     - GROQ_API_KEY=${GROQ_API_KEY}
+  #     - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+  #     - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - aicaller_net
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 512M
+
+networks:
+  aicaller_net:
+    name: aicaller_net
+    driver: bridge
+
+volumes:
+  redis_data:
+    name: aicaller_redis_data
+  traefik_certs:
+    name: aicaller_traefik_certs
