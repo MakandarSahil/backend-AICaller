@@ -1,21 +1,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # docker-compose.prod.yml
 #
-# Used for ALL VM deployments — both dev branch and main branch.
-# Never used locally (use docker-compose.dev.yml for local dev).
+# VM DEPLOYMENT ONLY — never used locally.
+# For local dev use: docker-compose.dev.yml
 #
-# IMAGE_TAG is injected by GitHub Actions via .env:
-#   develop branch → dev-1.0.0-dev.5
-#   main branch    → 1.0.0
+# Deployed to: /home/spiderman/aicaller/prod/docker/
+# .env written here by GitHub Actions with IMAGE_TAG and all secrets.
 #
-# GitHub Actions runs:
-#   docker compose -f docker/docker-compose.prod.yml pull
-#   docker compose -f docker/docker-compose.prod.yml up -d traefik api redis
+# Services: Traefik + FastAPI + Redis
+# Worker: commented out until Phase 3
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
   # ── Traefik ────────────────────────────────────────────────────────────────
+  # Owns ports 80 and 443 on the VM.
+  # Auto-discovers api container via Docker labels.
+  # Gets SSL cert from Let's Encrypt for API_DOMAIN automatically.
   traefik:
     image: traefik:v3.6.5
     container_name: aicaller_traefik
@@ -26,15 +27,17 @@ services:
       - "--providers.docker.network=aicaller_net"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      # Redirect all HTTP → HTTPS
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Let's Encrypt — uses ACME_EMAIL from .env
       - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
       - "--api.dashboard=false"
       - "--log.level=WARN"
       - "--accesslog=true"
-      # Trust Cloudflare IPs for real client IP forwarding
+      # Trust Cloudflare IPs so real client IPs are logged correctly
       - "--entrypoints.websecure.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22"
     ports:
       - "80:80"
@@ -50,9 +53,9 @@ services:
           memory: 128M
 
   # ── FastAPI ────────────────────────────────────────────────────────────────
+  # IMAGE_TAG injected by GitHub Actions via .env
+  # e.g. 1.0.0 / 1.0.1 / 1.1.0 etc.
   api:
-    # IMAGE_TAG set in .env by GitHub Actions
-    # e.g. dev-1.0.0-dev.5  or  1.0.0
     image: ${DOCKER_HUB_USERNAME}/aicaller-backend:${IMAGE_TAG}
     container_name: aicaller_api
     restart: always
@@ -96,6 +99,7 @@ services:
       - redis_data:/data
     networks:
       - aicaller_net
+    # NOT exposed on host ports — only reachable within Docker network
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -106,7 +110,8 @@ services:
         limits:
           memory: 256M
 
-  # ── Celery Worker (Phase 3 — uncomment when pipeline is ready) ─────────────
+  # ── Celery Worker — Phase 3 ────────────────────────────────────────────────
+  # Uncomment when STT→LLM→TTS pipeline is implemented
   # worker:
   #   image: ${DOCKER_HUB_USERNAME}/aicaller-backend:${IMAGE_TAG}
   #   container_name: aicaller_worker

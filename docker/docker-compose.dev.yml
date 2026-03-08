@@ -2,17 +2,24 @@
 # docker-compose.dev.yml
 #
 # LOCAL DEVELOPMENT ONLY — never used on VM.
-# VM deployments always use docker-compose.prod.yml.
+# VM always uses docker-compose.prod.yml.
 #
-# Features:
-#   - Builds image locally from Dockerfile
-#   - Hot reload via --reload (code changes apply instantly)
-#   - Source code mounted so changes reflect without rebuild
-#   - Traefik dashboard exposed at http://localhost:8080
+# Features vs prod:
+#   - Builds image locally from Dockerfile (no pre-built image needed)
+#   - Hot reload via uvicorn --reload (save a file → instant restart)
+#   - Source code mounted so changes apply without rebuilding
+#   - Traefik dashboard at http://localhost:8080
+#   - Direct API access at http://localhost:8000 (bypasses Traefik)
 #
 # Usage:
-#   docker compose -f docker/docker-compose.dev.yml up --build
+#   # Start (first time or after requirements.txt change):
 #   docker compose -f docker/docker-compose.dev.yml up --build traefik api redis
+#
+#   # Start (normal, no rebuild):
+#   docker compose -f docker/docker-compose.dev.yml up traefik api redis
+#
+#   # Stop:
+#   docker compose -f docker/docker-compose.dev.yml down
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -36,7 +43,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"     # Traefik dashboard
+      - "8080:8080"    # Traefik dashboard — dev only
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/traefik.dev.yml:/etc/traefik/traefik.yml:ro
@@ -44,20 +51,15 @@ services:
       - traefik_certs_dev:/letsencrypt
     networks:
       - aicaller_dev_net
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=Host(`traefik.localhost`)"
-      - "traefik.http.routers.dashboard.service=api@internal"
 
   # ── FastAPI ────────────────────────────────────────────────────────────────
   api:
-    # Builds from local Dockerfile — for local dev only
     build:
-      context: ..
+      context: ..          # repo root — where Dockerfile lives
       dockerfile: Dockerfile
     container_name: aicaller_api_dev
     restart: unless-stopped
-    # Override CMD: use --reload for hot reload during development
+    # Override Dockerfile CMD: use --reload for hot reloading
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
@@ -65,10 +67,10 @@ services:
       --reload
       --reload-dir /app/app
     volumes:
-      # Mount source so file changes reflect instantly without rebuilding
+      # Mount source — file changes reflect instantly, no rebuild needed
       - ../app:/app/app:ro
     env_file:
-      - ../.env
+      - ../.env            # your local .env file
     environment:
       - ENV=development
       - REDIS_URL=redis://redis:6379/0
@@ -77,6 +79,8 @@ services:
         condition: service_healthy
     networks:
       - aicaller_dev_net
+    ports:
+      - "8000:8000"        # direct access without Traefik
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.api.rule=PathPrefix(`/`)"
@@ -107,7 +111,7 @@ services:
         limits:
           memory: 256M
 
-  # ── Celery Worker (Phase 3 — uncomment when pipeline is ready) ─────────────
+  # ── Celery Worker — Phase 3 ────────────────────────────────────────────────
   # worker:
   #   build:
   #     context: ..

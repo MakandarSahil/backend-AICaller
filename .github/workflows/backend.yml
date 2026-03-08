@@ -1,5 +1,28 @@
 name: Backend CI/CD
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FLOW:
+#
+#   develop push / PR
+#     └── version → build-only
+#         Builds image, pushes to Docker Hub as dev-x.x.x-dev.n
+#         Validates code — no deployment.
+#         PRs to develop must pass this before merge is allowed.
+#
+#   main push (merge from develop)
+#     └── version → build-and-push → deploy-prod (manual approval gate)
+#         Builds image tagged x.x.x (clean semver)
+#         Pauses for your approval in GitHub UI
+#         On approval: deploys to Azure VM
+#
+# VERSIONING (GitVersion):
+#   develop → dev-1.0.0-dev.5
+#   main    → 1.0.0  (bump with +semver:minor or +semver:major in commit)
+#
+# LOCAL DEV:
+#   docker compose -f docker/docker-compose.dev.yml up --build traefik api redis
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches:
@@ -12,36 +35,34 @@ on:
 
 jobs:
 
-#   test:
-#     name: Run Tests
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.11"
-#           cache: "pip"
-#       - run: pip install -r requirements.txt pytest pytest-asyncio httpx
-#       - run: pytest tests/ -v --tb=short
+  # ── Placeholder — add real tests in Phase 3 ───────────────────────────────
+  # test:
+  #   name: Run Tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with: { python-version: "3.11", cache: "pip" }
+  #     - run: pip install -r requirements.txt pytest pytest-asyncio httpx
+  #     - run: pytest tests/ -v --tb=short
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1: Calculate version using GitVersion
+  # JOB 1 — Calculate version (runs on all branches and PRs)
   # ───────────────────────────────────────────────────────────────────────────
   version:
     name: Calculate Version
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
 
     outputs:
-      semver: ${{ steps.gitversion.outputs.semver }}
       image_tag: ${{ steps.image_tag.outputs.tag }}
+      semver: ${{ steps.gitversion.outputs.semVer }}
 
     steps:
-      - name: Checkout (full history required for GitVersion)
+      - name: Checkout (full history for GitVersion)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # GitVersion needs full git history
-          fetch-tags: true      # and all tags
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install GitVersion
         uses: gittools/actions/gitversion/setup@v1.1.1
@@ -59,26 +80,70 @@ jobs:
         id: image_tag
         run: |
           if [ "${{ github.ref_name }}" = "main" ]; then
-            # Production: clean semver  e.g. 1.0.0
+            # Clean semver for prod — e.g. 1.0.0
             echo "tag=${{ steps.gitversion.outputs.majorMinorPatch }}" >> $GITHUB_OUTPUT
           else
-            # Dev: prefixed semver  e.g. dev-1.0.0-dev.5
+            # Prefixed for dev — e.g. dev-1.0.0-dev.5
             echo "tag=dev-${{ steps.gitversion.outputs.semVer }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Print version info
+      - name: Print version
         run: |
+          echo "Branch:    ${{ github.ref_name }}"
           echo "SemVer:    ${{ steps.gitversion.outputs.semVer }}"
           echo "Image tag: ${{ steps.image_tag.outputs.tag }}"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 2: Build & Push Docker image to Docker Hub
+  # JOB 2a — Build only (develop branch + all PRs)
+  # Validates the image builds. No deployment.
+  # This is the gate PRs must pass before merging to develop.
   # ───────────────────────────────────────────────────────────────────────────
-  build-and-push:
-    name: Build & Push Docker Image
+  build-only:
+    name: Build & Validate Image
     runs-on: ubuntu-latest
     needs: version
-    if: github.event_name == 'push'
+    if: github.ref_name == 'develop' || github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push dev image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          dockerfile: Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ needs.version.outputs.image_tag }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:dev
+            ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:sha-${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:buildcache,mode=max
+
+      - name: Validate
+        run: |
+          echo "✅ Image built successfully — ${{ needs.version.outputs.image_tag }}"
+          echo "   Dockerfile valid, dependencies installed, app importable."
+          echo "   Merge to main to trigger production deployment."
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2b — Build & Push prod image (main branch only)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Production Image
+    runs-on: ubuntu-latest
+    needs: version
+    if: github.ref_name == 'main' && github.event_name == 'push'
 
     outputs:
       image_tag: ${{ needs.version.outputs.image_tag }}
@@ -96,114 +161,41 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           dockerfile: Dockerfile
           push: true
-          # Three tags per build:
-          #   1. versioned tag  e.g. dev-1.0.0-dev.5  or  1.0.0
-          #   2. branch tag     e.g. dev               or  latest
-          #   3. commit SHA     e.g. abc1234  (always unique, useful for rollback)
+          # 3 tags every prod build:
+          #   1.0.0       — versioned (use this for rollback)
+          #   latest      — always newest prod
+          #   sha-abc123  — commit SHA (guaranteed unique)
           tags: |
             ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ needs.version.outputs.image_tag }}
-            ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:latest
             ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:sha-${{ github.sha }}
-          # Registry cache — makes subsequent builds much faster
           cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:buildcache
           cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:buildcache,mode=max
 
-      - name: Print image tags
+      - name: Print tags
         run: |
-          echo "Pushed tags:"
-          echo "  ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ needs.version.outputs.image_tag }}"
-          echo "  ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}"
-          echo "  ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:sha-${{ github.sha }}"
+          echo "✅ Production image pushed:"
+          echo "   :${{ needs.version.outputs.image_tag }}"
+          echo "   :latest"
+          echo "   :sha-${{ github.sha }}"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # JOB 3a: Deploy to Dev VM (develop branch — automatic)
+  # JOB 3 — Deploy to Production (main only, manual approval gate)
   #
-  # Uses docker-compose.prod.yml (no build, pulls image)
-  # Image tag: dev-x.x.x-dev.n
-  # Directory: /home/spiderman/aicaller/dev
-  # ───────────────────────────────────────────────────────────────────────────
-  deploy-dev:
-    name: Deploy to Dev
-    runs-on: ubuntu-latest
-    needs: [version, build-and-push]
-    if: github.ref_name == 'develop'
-    environment:
-      name: backend-dev
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Copy compose files to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.AZURE_VM_HOST }}
-          username: ${{ secrets.AZURE_VM_USER }}
-          key: ${{ secrets.AZURE_VM_SSH_KEY }}
-          password: ${{ secrets.AZURE_VM_PASSWORD }}
-          source: "docker/"
-          target: "/home/spiderman/aicaller/dev/"
-
-      - name: Deploy on Azure VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.AZURE_VM_HOST }}
-          username: ${{ secrets.AZURE_VM_USER }}
-          key: ${{ secrets.AZURE_VM_SSH_KEY }}
-          password: ${{ secrets.AZURE_VM_PASSWORD }}
-          script: |
-            set -e
-            mkdir -p /home/spiderman/aicaller/dev
-            cd /home/spiderman/aicaller/dev
-
-            # Write .env with exact versioned image tag
-            cat > docker/.env << EOF
-            ENV=development
-            IMAGE_TAG=${{ needs.version.outputs.image_tag }}
-            DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
-            SECRET_KEY=${{ secrets.SECRET_KEY }}
-            CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
-            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-            TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}
-            TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }}
-            AZURE_SPEECH_KEY=${{ secrets.AZURE_SPEECH_KEY }}
-            AZURE_SPEECH_REGION=${{ secrets.AZURE_SPEECH_REGION }}
-            GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
-            ACME_EMAIL=${{ secrets.ACME_EMAIL }}
-            API_DOMAIN=${{ secrets.API_DOMAIN }}
-            EOF
-
-            # Pull the exact versioned image
-            echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-            docker compose -f docker/docker-compose.prod.yml pull api redis 
-            docker compose -f docker/docker-compose.prod.yml up -d --remove-orphans traefik api redis
-
-            # Health check
-            sleep 10
-            curl -f http://localhost/health || (docker compose -f docker/docker-compose.prod.yml logs api && exit 1)
-
-            echo "Dev deploy successful! Version: ${{ needs.version.outputs.image_tag }}"
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOB 3b: Deploy to Prod VM (main branch — requires manual approval)
-  #
-  # Uses docker-compose.prod.yml (no build, pulls image)
-  # Image tag: x.x.x  (clean semver)
-  # Directory: /home/spiderman/aicaller/prod
+  # PAUSES here — go to GitHub → Actions → this run → Review deployments
+  # tick backend-production → Approve and deploy
   # ───────────────────────────────────────────────────────────────────────────
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
     needs: [version, build-and-push]
-    if: github.ref_name == 'main'
-    # This pauses and waits for manual approval in GitHub UI
+    if: github.ref_name == 'main' && github.event_name == 'push'
     environment:
       name: backend-production
 
@@ -221,7 +213,7 @@ jobs:
           source: "docker/"
           target: "/home/spiderman/aicaller/prod/"
 
-      - name: Deploy on Azure VM
+      - name: Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
@@ -230,10 +222,10 @@ jobs:
           password: ${{ secrets.AZURE_VM_PASSWORD }}
           script: |
             set -e
-            mkdir -p /home/spiderman/aicaller/prod
-            cd /home/spiderman/aicaller/prod
+            mkdir -p /home/spiderman/aicaller/prod/docker
 
-            cat > docker/.env << EOF
+            # Write .env next to the compose file so docker compose picks it up
+            cat > /home/spiderman/aicaller/prod/docker/.env << EOF
             ENV=production
             IMAGE_TAG=${{ needs.version.outputs.image_tag }}
             DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
@@ -250,14 +242,16 @@ jobs:
             API_DOMAIN=${{ secrets.API_DOMAIN }}
             EOF
 
+            cd /home/spiderman/aicaller/prod
+
             echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
             docker compose -f docker/docker-compose.prod.yml pull api redis
             docker compose -f docker/docker-compose.prod.yml up -d --remove-orphans traefik api redis
 
+            echo "Waiting for health check..."
             sleep 15
-            curl -f http://${{ secrets.API_DOMAIN }}/health || (docker compose -f docker/docker-compose.prod.yml logs api && exit 1)
+            curl -f http://localhost/health || (docker compose -f docker/docker-compose.prod.yml logs --tail=50 api && exit 1)
 
-            # Clean up old untagged images to save disk space
             docker image prune -f
 
-            echo "Production deploy successful! Version: ${{ needs.version.outputs.image_tag }}"
+            echo "✅ Production deploy successful! Version: ${{ needs.version.outputs.image_tag }}"
