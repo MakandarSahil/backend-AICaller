@@ -121,7 +121,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          dockerfile: Dockerfile
+          file: Dockerfile
           push: true
           tags: |
             ${{ secrets.DOCKER_HUB_USERNAME }}/aicaller-backend:${{ needs.version.outputs.image_tag }}
@@ -165,7 +165,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          dockerfile: Dockerfile
+          file: Dockerfile
           push: true
           # 3 tags every prod build:
           #   1.0.0       — versioned (use this for rollback)
