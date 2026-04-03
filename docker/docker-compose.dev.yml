@@ -68,6 +68,7 @@ services:
       --reload-dir /app/app
     volumes:
       - ../app:/app/app:ro
+      - ../logs:/app/logs
     env_file:
       - ../.env
     environment:
