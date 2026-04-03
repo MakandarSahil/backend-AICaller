@@ -1,32 +1,32 @@
 # ── Web framework ─────────────────────────────────────────────────────────────
-fastapi==0.115.0
-uvicorn[standard]==0.30.6      # ASGI server (standard = with websocket support)
-python-multipart==0.0.9        # needed for form/file uploads later
+fastapi==0.115.5
+uvicorn[standard]==0.32.1          # includes uvloop + httptools (matched to Dockerfile CMD)
+websockets==13.1                   # FastAPI WebSocket transport
+python-multipart==0.0.12           # required for form data (Twilio webhooks)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-pydantic-settings==2.4.0       # reads .env files into typed Settings class
+# ── Settings ───────────────────────────────────────────────────────────────────
+pydantic==2.9.2
+pydantic-settings==2.6.1           # BaseSettings with .env support
 
-# ── Redis ─────────────────────────────────────────────────────────────────────
-redis[asyncio]==5.0.8          # async Redis client
+# ── Supabase ───────────────────────────────────────────────────────────────────
+supabase==2.10.0                   # async client (supabase._async.client)
+httpx==0.27.2                      # supabase-py peer dep (pin to avoid conflicts)
 
-# ── Task queue (Celery) ───────────────────────────────────────────────────────
+# ── Redis ──────────────────────────────────────────────────────────────────────
+redis==5.2.0                       # redis.asyncio for async client
+
+# ── Celery (task queue) ───────────────────────────────────────────────────────
 celery==5.4.0
-flower==2.0.1                  # Celery monitoring UI (optional, dev only)
+kombu==5.3.7                       # Celery messaging (peer dep — pin for stability)
 
-# ── HTTP client ───────────────────────────────────────────────────────────────
-httpx==0.27.2                  # async HTTP client for calling external APIs
+# ── LLM ────────────────────────────────────────────────────────────────────────
+groq==0.11.0                       # Official Groq SDK — AsyncGroq
 
-# ── Supabase (server-side) ────────────────────────────────────────────────────
-supabase==2.7.4
+# ── Azure Speech (STT + TTS) ──────────────────────────────────────────────────
+azure-cognitiveservices-speech==1.41.1
 
-# ── Twilio ────────────────────────────────────────────────────────────────────
-twilio==9.3.2
+# ── Twilio ─────────────────────────────────────────────────────────────────────
+twilio==9.3.6                      # Twilio helper lib (webhook validation etc.)
 
-# ── Azure Speech ──────────────────────────────────────────────────────────────
-azure-cognitiveservices-speech==1.40.0
-
-# ── Groq LLM ──────────────────────────────────────────────────────────────────
-groq==0.11.0
-
-# ── Utilities ────────────────────────────────────────────────────────────────
-python-dotenv==1.0.1
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1               # .env loading (pydantic-settings uses this)
