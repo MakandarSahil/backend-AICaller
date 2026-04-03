@@ -50,6 +50,8 @@ services:
     image: ${DOCKER_HUB_USERNAME}/aicaller-backend:${IMAGE_TAG}
     container_name: aicaller_api
     restart: always
+    volumes:
+      - backend_logs:/app/logs
     environment:
       - ENV=${ENV}
       - REDIS_URL=redis://redis:6379/0
@@ -142,3 +144,5 @@ volumes:
     name: aicaller_redis_data
   traefik_certs:
     name: aicaller_traefik_certs
+  backend_logs:
+    name: aicaller_backend_logs

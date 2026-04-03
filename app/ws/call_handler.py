@@ -26,8 +26,11 @@ from app.utils.audio import calculate_volume, mulaw_to_pcm16
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+_VOICE_ACTIVITY_THRESHOLD = 8.0
+_PARTIAL_COMMIT_SILENCE_CHUNKS = 25  # ~500ms at 20ms Twilio media frames
 
-async def handle_call(websocket: WebSocket, agent_id: str) -> None:
+
+async def handle_call(websocket: WebSocket, agent_id: str | None) -> None:
     """
     Main WebSocket handler for a Twilio Media Stream call.
 
@@ -40,6 +43,7 @@ async def handle_call(websocket: WebSocket, agent_id: str) -> None:
     """
     await websocket.accept()
     call_sid: str | None = None
+    resolved_agent_id = agent_id
 
     try:
         async for raw in websocket.iter_text():
@@ -50,7 +54,16 @@ async def handle_call(websocket: WebSocket, agent_id: str) -> None:
             event = msg.get("event")
 
             if event == "start":
-                call_sid = await _handle_start(websocket, msg, agent_id)
+                start = msg.get("start", {})
+                custom = start.get("customParameters") or {}
+                resolved_agent_id = resolved_agent_id or custom.get("agent_id")
+
+                if not resolved_agent_id:
+                    logger.warning("Call start missing agent_id; closing websocket")
+                    await websocket.close(code=1008)
+                    break
+
+                call_sid = await _handle_start(websocket, msg, resolved_agent_id)
 
             elif event == "media":
                 if call_sid:
@@ -118,13 +131,19 @@ async def _handle_start(websocket: WebSocket, msg: dict, agent_id: str) -> str:
     session.conversation_id = await _create_active_conversation(session)
 
     # Wire up STT callbacks — each call gets its own AzureSTT instance
+    loop = asyncio.get_running_loop()
+
     def on_partial(text: str) -> None:
+        session.stt_partial_text = text.strip()
         logger.debug("STT partial [%s]: %s", call_sid, text)
 
     def on_final(text: str) -> None:
+        if session.stopped:
+            logger.debug("STT on_final ignored — session already stopped [%s]", session.call_sid)
+            return
+
         # Azure STT callbacks fire on a background thread.
         # Schedule the async pipeline back onto the event loop safely.
-        loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(
             lambda: asyncio.ensure_future(
                 _handle_final_transcript(websocket, session, text)
@@ -138,7 +157,7 @@ async def _handle_start(websocket: WebSocket, msg: dict, agent_id: str) -> str:
         on_partial=on_partial,
         on_final=on_final,
         on_error=on_error,
-        language=session.agent_config.get("stt_model") or settings.stt_language,
+        language=_resolve_stt_language(session.agent_config),
     )
     session.stt_recognizer.start()
 
@@ -159,12 +178,47 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
         return
 
     session.latest_media_timestamp = int(media.get("timestamp", 0))
+    session.media_packet_count += 1
     mulaw_bytes = base64.b64decode(payload_b64)
 
+    if session.media_packet_count % 50 == 0:
+        logger.debug(
+            "Twilio media received: call_sid=%s packets=%d ts=%s bytes=%d speaking=%s",
+            session.call_sid,
+            session.media_packet_count,
+            session.latest_media_timestamp,
+            len(mulaw_bytes),
+            session.is_speaking,
+        )
+
     if not session.is_speaking:
+        volume = calculate_volume(mulaw_bytes)
+
+        if volume > _VOICE_ACTIVITY_THRESHOLD:
+            session.stt_silence_chunks = 0
+        else:
+            session.stt_silence_chunks += 1
+
         pcm16 = mulaw_to_pcm16(mulaw_bytes)
         if session.stt_recognizer:
             session.stt_recognizer.push(pcm16)
+
+        # Azure can delay final transcripts until stream stop in some PSTN paths.
+        # Fallback: if we have a partial and then sustained silence, commit it now.
+        if (
+            session.stt_partial_text
+            and session.stt_silence_chunks >= _PARTIAL_COMMIT_SILENCE_CHUNKS
+            and not session.stopped
+        ):
+            partial_text = session.stt_partial_text
+            session.stt_partial_text = ""
+            session.stt_silence_chunks = 0
+            logger.info(
+                "STT partial committed on silence [%s]: %s",
+                session.call_sid,
+                partial_text,
+            )
+            asyncio.create_task(_handle_final_transcript(websocket, session, partial_text))
     else:
         volume = calculate_volume(mulaw_bytes)
         if volume > settings.barge_in_threshold:
@@ -256,9 +310,24 @@ async def _handle_final_transcript(
         Each call has its own session with its own is_speaking, conversation_history,
         and TTS cancel handle. There is no shared state touched here.
     """
+    if session.stopped:
+        logger.debug("_handle_final_transcript ignored — session stopped [%s]", session.call_sid)
+        return
+
     text = text.strip()
     if not text:
         return
+
+    # Ignore duplicate user transcript that can happen when a fallback partial
+    # commit is followed by a late Azure final callback with the same text.
+    if session.conversation_history:
+        last_turn = session.conversation_history[-1]
+        if last_turn.get("role") == "user":
+            last_text = " ".join(last_turn.get("content", "").strip().lower().split())
+            curr_text = " ".join(text.lower().split())
+            if last_text and curr_text and last_text == curr_text:
+                logger.debug("Duplicate transcript ignored [%s]: %s", session.call_sid, text)
+                return
 
     # Guard: if already speaking (very fast back-to-back utterances), ignore
     if session.is_speaking:
@@ -456,3 +525,13 @@ def _extract_caller_phone(start: dict) -> str:
         if start.get(key):
             return start[key]
     return ""
+
+
+def _resolve_stt_language(agent_config: dict[str, Any]) -> str:
+    """Resolve the Azure speech recognition locale from agent config."""
+    for key in ("stt_language", "stt_locale", "stt_model"):
+        value = str(agent_config.get(key) or "").strip()
+        if value and value.lower() != "default":
+            return value
+
+    return settings.stt_language
