@@ -21,7 +21,9 @@ router = APIRouter()
 _TWIML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{ws_url}?agent_id={agent_id}" />
+        <Stream url="{ws_url}">
+            <Parameter name="agent_id" value="{agent_id}" />
+        </Stream>
   </Connect>
 </Response>"""
 
@@ -104,9 +106,28 @@ async def _validate_twilio_signature(request: Request) -> bool:
     try:
         from twilio.request_validator import RequestValidator
         signature = request.headers.get("X-Twilio-Signature", "")
-        url = str(request.url)
+        # Twilio signs the public webhook URL. Behind Traefik, request.url can be
+        # internal unless forwarded headers are respected, so reconstruct safely.
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if forwarded_proto and forwarded_host:
+            query = f"?{request.url.query}" if request.url.query else ""
+            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}{query}"
+        else:
+            url = str(request.url)
+
         params = dict(await request.form()) if request.method == "POST" else {}
-        return RequestValidator(settings.twilio_auth_token).validate(url, params, signature)
+        is_valid = RequestValidator(settings.twilio_auth_token).validate(url, params, signature)
+        if not is_valid:
+            logger.warning(
+                "Twilio signature mismatch: method=%s host=%s fwd_host=%s fwd_proto=%s path=%s",
+                request.method,
+                request.headers.get("host"),
+                request.headers.get("x-forwarded-host"),
+                request.headers.get("x-forwarded-proto"),
+                request.url.path,
+            )
+        return is_valid
     except Exception as exc:
         logger.error("Twilio signature validation error: %s", exc)
         return False

@@ -74,9 +74,16 @@ class AzureSTT:
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
             "1000",
         )
+        if hasattr(speechsdk.PropertyId, "Speech_SegmentationSilenceTimeoutMs"):
+            # Helps continuous recognition finalize an utterance sooner after
+            # caller pause, so LLM/TTS can respond mid-call.
+            self._speech_config.set_property(
+                speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                "700",
+            )
 
         # Push stream — PCM16 8kHz mono (Twilio's native format after mulaw decode)
-        audio_format = speechsdk.audio.AudioStreamFormat.get_wave_format_pcm(
+        audio_format = speechsdk.audio.AudioStreamFormat(
             samples_per_second=8000,
             bits_per_sample=16,
             channels=1,
@@ -159,6 +166,8 @@ class AzureSTT:
                     logger.error("STT on_final callback error: %s", exc)
         elif evt.result.reason == speechsdk.ResultReason.NoMatch:
             logger.debug("STT no match: %s", evt.result.no_match_details)
+        else:
+            logger.debug("STT recognized event with reason=%s", evt.result.reason)
 
     def _handle_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when recognition is canceled (error or explicit stop)."""

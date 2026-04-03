@@ -71,6 +71,9 @@ class SessionState:
     latest_media_timestamp: int = 0
     # Twilio media event timestamp (ms). Used to calculate response latency.
 
+    media_packet_count: int = 0
+    # Counts Twilio media packets received for this call.
+
     # ── Barge-in detection ─────────────────────────────────────────────────
     barge_in_loud_samples: int = 0
     # Count of consecutive loud mulaw chunks received while is_speaking.
@@ -80,6 +83,12 @@ class SessionState:
     # ── Azure STT handle ───────────────────────────────────────────────────
     stt_recognizer: Any | None = None
     # AzureSTT instance. Created on call start, stopped on call end.
+
+    stt_partial_text: str = ""
+    # Latest partial transcript text from Azure STT.
+
+    stt_silence_chunks: int = 0
+    # Consecutive low-volume chunks while not speaking.
 
     # ── Sentence counter ───────────────────────────────────────────────────
     sentence_count: int = 0

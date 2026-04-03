@@ -1,6 +1,8 @@
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +17,31 @@ from app.ws.call_handler import handle_call
 settings = get_settings()
 START_TIME = time.time()
 
-logging.basicConfig(
-    level=logging.DEBUG if not settings.is_production else logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
+log_level = logging.DEBUG if not settings.is_production else logging.INFO
+log_format = "%(asctime)s %(levelname)s %(name)s — %(message)s"
+
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(log_level)
+stream_handler.setFormatter(logging.Formatter(log_format))
+
+handlers: list[logging.Handler] = [stream_handler]
+try:
+    log_dir = os.path.dirname(settings.log_file) or "."
+    os.makedirs(log_dir, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        settings.log_file,
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    handlers.append(file_handler)
+except Exception as exc:
+    # Keep app booting even if file logger cannot be created.
+    logging.getLogger(__name__).warning("File logger disabled: %s", exc)
+
+logging.basicConfig(level=log_level, handlers=handlers, force=True)
 logger = logging.getLogger(__name__)
 
 
@@ -224,7 +247,7 @@ async def health_ready():
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 @app.websocket("/call")
-async def ws_call(websocket: WebSocket, agent_id: str):
+async def ws_call(websocket: WebSocket, agent_id: str | None = None):
     """
     Twilio Media Stream WebSocket.
     URL: wss://api.callmind.com/call?agent_id={uuid}
