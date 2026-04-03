@@ -9,6 +9,7 @@ Pipeline: text -> KB + history -> build_prompt -> Groq -> SSE or JSON
 No STT, no TTS.
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -311,6 +312,10 @@ async def _sse_generator(
                 data = json.dumps({"delta": sentence})
 
             yield f"data: {data}\n\n"
+            # Give the event loop a chance to flush the chunk to the client.
+            # This does not slow generation; it only avoids buffering multiple
+            # deltas into one network write under tight async loops.
+            await asyncio.sleep(0)
 
         yield "data: [DONE]\n\n"
 

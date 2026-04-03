@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 from groq import AsyncGroq
 
 from app.config import get_settings
-from app.models.query import LLMProvider, QueryPayload
+from app.models.query import Channel, LLMProvider, QueryPayload
 from app.pipeline.prompt import build_prompt
 
 settings = get_settings()
@@ -85,6 +85,7 @@ async def _stream_groq(payload: QueryPayload) -> AsyncGenerator[str, None]:
     client = get_groq_client()
     buffer = ""
     chunk_count = 0
+    is_text_stream = payload.channel == Channel.TEXT_API
 
     try:
         stream = await client.chat.completions.create(
@@ -101,6 +102,14 @@ async def _stream_groq(payload: QueryPayload) -> AsyncGenerator[str, None]:
                 continue
 
             chunk_count += 1
+
+            # Text chat UX should feel truly live: stream each provider delta
+            # instead of waiting for sentence boundaries.
+            if is_text_stream:
+                logger.debug("[LLM] delta chars=%d text=%r", len(delta), delta[:120])
+                yield delta
+                continue
+
             buffer += delta
 
             while True:
@@ -113,10 +122,11 @@ async def _stream_groq(payload: QueryPayload) -> AsyncGenerator[str, None]:
                     logger.debug("[LLM] sentence chars=%d text=%r", len(sentence), sentence[:120])
                     yield sentence
 
-        final = buffer.strip()
-        if len(final) >= _MIN_SENTENCE_LEN:
-            logger.debug("[LLM] final_fragment chars=%d text=%r", len(final), final[:120])
-            yield final
+        if not is_text_stream:
+            final = buffer.strip()
+            if len(final) >= _MIN_SENTENCE_LEN:
+                logger.debug("[LLM] final_fragment chars=%d text=%r", len(final), final[:120])
+                yield final
 
         logger.info(
             "[LLM] response_complete provider=groq agent=%s chunks=%d",
