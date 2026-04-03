@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # server
     port: str = "8000"
-    public_url: str = "https://determination-barbara-strongly-adjustments.trycloudflare.com"
+    public_url: str = "https://api.iamspiderman.me"
     secret_key: str = "secret"
     cors_origins: str = "*"
     log_file: str = "/app/logs/backend.log"
