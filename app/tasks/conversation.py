@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+from collections import Counter
 
 from celery import Celery
 
@@ -143,6 +145,8 @@ async def _save_async(
     # ── 3. Generate summary ────────────────────────────────────────────────
     summary = await _generate_summary(groq, conversation_history)
 
+    analysis = _analyze_conversation(conversation_history)
+
     # ── 4. UPDATE conversation row → completed ────────────────────────────
     await (
         supabase.table("conversations")
@@ -151,15 +155,55 @@ async def _save_async(
             "summary": summary,
             "ended_at": "now()",
             "message_count": len(conversation_history),
+            "had_tool_call": analysis["had_tool_call"],
         })
         .eq("id", conversation_id)
         .execute()
     )
 
-    # ── 5. Increment agent_usage properly ─────────────────────────────────
-    # BUG FIX: Previous code set total_calls=1 every time (overwrote instead
-    # of incremented). Now we fetch current values first, then add to them.
-    await _increment_agent_usage(supabase, agent_id, len(conversation_history))
+    # Outcome is best-effort so it never blocks status finalization.
+    try:
+        await (
+            supabase.table("conversations")
+            .update({"outcome": analysis["outcome"]})
+            .eq("id", conversation_id)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not set outcome for conv_id=%s: %s",
+            conversation_id,
+            exc,
+        )
+
+    # Persist V2 analytics row (upsert by conversation_id)
+    try:
+        await (
+            supabase.table("conversation_analytics")
+            .upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "overall_intent": analysis["overall_intent"],
+                    "sentiment_start": analysis["sentiment_start"],
+                    "sentiment_end": analysis["sentiment_end"],
+                    "sentiment_arc": analysis["sentiment_arc"],
+                    "topics": analysis["topics"],
+                    "entities_mentioned": analysis["entities_mentioned"],
+                    "outcome": analysis["outcome"],
+                    "resolution_turns": analysis["resolution_turns"],
+                    "key_phrases": analysis["key_phrases"],
+                    "tool_calls_made": analysis["tool_calls_made"],
+                },
+                on_conflict="conversation_id",
+            )
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not upsert conversation_analytics conv_id=%s: %s",
+            conversation_id,
+            exc,
+        )
 
     logger.info(
         "save_conversation complete: call_sid=%s conv_id=%s", call_sid, conversation_id
@@ -169,48 +213,6 @@ async def _save_async(
         "conversation_id": conversation_id,
         "message_count": len(conversation_history),
     }
-
-
-async def _increment_agent_usage(supabase, agent_id: str, message_count: int) -> None:
-    """
-    Safely increment total_calls and total_messages on agent_usage.
-
-    BUG FIX: The old upsert({ total_calls: 1 }) overwrote the count every time.
-    Correct approach: fetch current values → add → upsert with updated values.
-    Single Celery worker with concurrency=2 makes this safe enough for v1
-    (two tasks finishing simultaneously is extremely unlikely for the same agent).
-    """
-    try:
-        current = (
-            await supabase.table("agent_usage")
-            .select("total_calls, total_messages")
-            .eq("agent_id", agent_id)
-            .maybe_single()
-            .execute()
-        )
-
-        if current.data:
-            new_calls = (current.data.get("total_calls") or 0) + 1
-            new_messages = (current.data.get("total_messages") or 0) + message_count
-        else:
-            new_calls = 1
-            new_messages = message_count
-
-        await (
-            supabase.table("agent_usage")
-            .upsert(
-                {
-                    "agent_id": agent_id,
-                    "total_calls": new_calls,
-                    "total_messages": new_messages,
-                    "last_active_at": "now()",
-                },
-                on_conflict="agent_id",
-            )
-            .execute()
-        )
-    except Exception as exc:
-        logger.error("agent_usage increment failed for agent=%s: %s", agent_id, exc)
 
 
 async def _generate_summary(groq, conversation_history: list[dict[str, str]]) -> str:
@@ -247,3 +249,114 @@ async def _generate_summary(groq, conversation_history: list[dict[str, str]]) ->
     except Exception as exc:
         logger.error("Summary generation failed: %s", exc)
         return ""
+
+
+_STOPWORDS = {
+    "the", "and", "for", "that", "with", "this", "have", "your", "from", "what",
+    "would", "there", "about", "hello", "thanks", "thank", "please", "agent", "call",
+    "just", "like", "need", "want", "you", "are", "was", "were", "will", "can",
+}
+
+
+def _analyze_conversation(conversation_history: list[dict[str, str]]) -> dict:
+    user_turns = [t.get("content", "") for t in conversation_history if t.get("role") == "user"]
+    assistant_turns = [t.get("content", "") for t in conversation_history if t.get("role") == "assistant"]
+    all_text = " ".join([*user_turns, *assistant_turns]).lower()
+
+    intent_keywords = {
+        "booking": ["book", "appointment", "schedule", "slot"],
+        "complaint": ["complaint", "issue", "problem", "angry", "bad"],
+        "pricing": ["price", "pricing", "cost", "fee", "charge"],
+        "support": ["help", "support", "assist", "guidance"],
+        "cancellation": ["cancel", "refund", "stop"],
+    }
+    intent_scores = {
+        intent: sum(all_text.count(token) for token in tokens)
+        for intent, tokens in intent_keywords.items()
+    }
+    overall_intent = max(intent_scores, key=intent_scores.get) if any(intent_scores.values()) else "general"
+
+    positive_tokens = ("thanks", "thank you", "great", "good", "perfect", "awesome", "resolved")
+    negative_tokens = ("problem", "issue", "not working", "bad", "angry", "frustrated", "complaint")
+
+    def _sentiment(text: str) -> str:
+        text_l = text.lower()
+        pos = sum(text_l.count(token) for token in positive_tokens)
+        neg = sum(text_l.count(token) for token in negative_tokens)
+        if pos > neg:
+            return "positive"
+        if neg > pos:
+            return "negative"
+        return "neutral"
+
+    sentiment_start = _sentiment(user_turns[0]) if user_turns else "neutral"
+    sentiment_end = _sentiment(user_turns[-1] if user_turns else all_text)
+    sentiment_arc = [
+        {"turn": index + 1, "sentiment": _sentiment(turn.get("content", ""))}
+        for index, turn in enumerate(conversation_history)
+    ]
+
+    topic_keywords = {
+        "pricing": ["price", "pricing", "cost"],
+        "support": ["issue", "support", "help"],
+        "booking": ["book", "appointment", "schedule"],
+        "delivery": ["delivery", "shipping", "courier"],
+    }
+    topics = [
+        topic for topic, tokens in topic_keywords.items()
+        if any(token in all_text for token in tokens)
+    ]
+
+    dates = re.findall(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", all_text)
+    times = re.findall(r"\b\d{1,2}:\d{2}\b", all_text)
+    phone_numbers = re.findall(r"\+?\d{10,15}\b", all_text)
+    entities_mentioned = {
+        "dates": dates[:10],
+        "times": times[:10],
+        "phones": phone_numbers[:10],
+    }
+
+    tool_markers = ("booked", "appointment confirmed", "sms sent", "transferring", "transfer")
+    had_tool_call = any(marker in all_text for marker in tool_markers)
+    tool_calls_made = []
+    if "booked" in all_text or "appointment" in all_text:
+        tool_calls_made.append({"tool": "booking", "success": True})
+    if "sms" in all_text:
+        tool_calls_made.append({"tool": "send_sms", "success": True})
+    if "transfer" in all_text:
+        tool_calls_made.append({"tool": "call_transfer", "success": True})
+
+    outcome = "hung_up"
+    if any(token in all_text for token in ("appointment confirmed", "booked", "scheduled")):
+        outcome = "booked"
+    elif any(token in all_text for token in ("transferring", "transferred", "human agent")):
+        outcome = "transferred"
+    elif any(token in all_text for token in ("resolved", "fixed", "done", "sorted")):
+        outcome = "resolved"
+    elif any(token in all_text for token in ("not resolved", "could not", "can't help", "cannot help")):
+        outcome = "unresolved"
+
+    resolution_turns = None
+    for idx, turn in enumerate(conversation_history, start=1):
+        text = turn.get("content", "").lower()
+        if any(token in text for token in ("resolved", "booked", "transferred", "appointment confirmed")):
+            resolution_turns = idx
+            break
+
+    words = re.findall(r"\b[a-z]{4,}\b", all_text)
+    phrase_counter = Counter(word for word in words if word not in _STOPWORDS)
+    key_phrases = [word for word, _ in phrase_counter.most_common(8)]
+
+    return {
+        "overall_intent": overall_intent,
+        "sentiment_start": sentiment_start,
+        "sentiment_end": sentiment_end,
+        "sentiment_arc": sentiment_arc,
+        "topics": topics,
+        "entities_mentioned": entities_mentioned,
+        "outcome": outcome,
+        "resolution_turns": resolution_turns,
+        "key_phrases": key_phrases,
+        "had_tool_call": had_tool_call,
+        "tool_calls_made": tool_calls_made,
+    }

@@ -15,7 +15,7 @@ import logging
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -23,10 +23,27 @@ from app.clients.supabase import get_supabase
 from app.middleware.auth import AuthContext, get_auth_context
 from app.models.query import Channel, QueryPayload, TextQueryRequest, TextQueryResponse
 from app.pipeline.llm import stream_llm_full, stream_llm_sentences
+from app.pipeline.tts import synthesize_preview_wav
 from app.pipeline.session import load_agent_config, load_kb_documents
 
 router = APIRouter(tags=["query"])
 logger = logging.getLogger(__name__)
+
+_OFF_TOPIC_PATTERNS = (
+    "weather",
+    "joke",
+    "movie",
+    "music",
+    "song",
+    "sports",
+    "news",
+    "capital of",
+    "who are you",
+    "what are you",
+    "your name",
+    "how old are you",
+    "translate",
+)
 
 
 class SSEChunk(BaseModel):
@@ -56,6 +73,12 @@ class ErrorResponse(BaseModel):
             ]
         }
     }
+
+
+class TTSPreviewRequest(BaseModel):
+    agent_id: str
+    text: str
+    voice: str | None = None
 
 
 @router.post(
@@ -164,6 +187,18 @@ async def text_query(
         current_conversation_id=conversation_id,
     )
 
+    if _is_obviously_off_topic(request.text):
+        refusal_text = _build_refusal_text(agent_config)
+        await _save_message(conversation_id, "user", request.text)
+        await _save_message(conversation_id, "assistant", refusal_text)
+        await _mark_conversation_completed(conversation_id)
+        logger.info("[QUERY] off_topic_refusal agent=%s conv=%s", request.agent_id, conversation_id)
+        return TextQueryResponse(
+            text=refusal_text,
+            conversation_id=conversation_id,
+            agent_id=request.agent_id,
+        )
+
     payload = QueryPayload(
         agent_id=request.agent_id,
         text=request.text,
@@ -198,10 +233,67 @@ async def text_query(
 
     full_text = await stream_llm_full(payload)
     await _save_message(conversation_id, "assistant", full_text)
+    await _mark_conversation_completed(conversation_id)
     return TextQueryResponse(
         text=full_text,
         conversation_id=conversation_id,
         agent_id=request.agent_id,
+    )
+
+
+@router.post(
+    "/query/tts-preview",
+    summary="Generate TTS preview audio for a selected voice",
+    response_description="WAV audio bytes synthesized by Azure TTS",
+    responses={
+        200: {
+            "description": "Audio preview generated",
+            "content": {"audio/wav": {}},
+        },
+        401: {
+            "description": "No credentials provided",
+            "content": {"application/json": {"example": {"detail": "Authentication required."}}},
+        },
+        403: {
+            "description": "Agent does not belong to your workspace",
+            "content": {
+                "application/json": {"example": {"detail": "Agent does not belong to your workspace"}}
+            },
+        },
+        404: {
+            "description": "Agent not found",
+            "content": {"application/json": {"example": {"detail": "Agent not found: abc-123"}}},
+        },
+        502: {
+            "description": "TTS synthesis failed",
+            "content": {"application/json": {"example": {"detail": "TTS preview synthesis failed"}}},
+        },
+    },
+)
+async def tts_preview(
+    request: TTSPreviewRequest,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Preview text is required")
+
+    agent_config = await load_agent_config(request.agent_id)
+    if not agent_config:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {request.agent_id}")
+
+    if agent_config.get("workspace_id") != auth.workspace_id:
+        raise HTTPException(status_code=403, detail="Agent does not belong to your workspace")
+
+    voice = request.voice or agent_config.get("tts_voice")
+    audio_bytes = await synthesize_preview_wav(text=text, voice=voice)
+    if not audio_bytes:
+        raise HTTPException(status_code=502, detail="TTS preview synthesis failed")
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -214,6 +306,18 @@ async def _get_or_create_conversation(
     supabase = get_supabase()
 
     if conversation_id:
+        conv = (
+            await supabase.table("conversations")
+            .select("id, agent_id")
+            .eq("id", conversation_id)
+            .maybe_single()
+            .execute()
+        )
+        if not conv.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.data.get("agent_id") != agent_id:
+            raise HTTPException(status_code=403, detail="Conversation does not belong to this agent")
+
         result = (
             await supabase.table("messages")
             .select("role, content")
@@ -292,6 +396,64 @@ async def _save_message(conversation_id: str, role: str, content: str) -> None:
         logger.error("Failed to save message conv=%s role=%s: %s", conversation_id, role, exc)
 
 
+async def _mark_conversation_completed(conversation_id: str) -> None:
+    try:
+        supabase = get_supabase()
+        await (
+            supabase.table("conversations")
+            .update({
+                "status": "completed",
+                "ended_at": "now()",
+            })
+            .eq("id", conversation_id)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Failed to mark conversation completed conv=%s: %s", conversation_id, exc)
+
+
+def _is_obviously_off_topic(text: str) -> bool:
+    normalized = " ".join(text.lower().strip().split())
+    if not normalized:
+        return False
+
+    if any(pattern in normalized for pattern in _OFF_TOPIC_PATTERNS):
+        business_keywords = (
+            "appointment",
+            "booking",
+            "book",
+            "call",
+            "support",
+            "help",
+            "price",
+            "pricing",
+            "hours",
+            "timing",
+            "service",
+            "agent",
+            "order",
+            "refund",
+            "shipping",
+            "delivery",
+            "status",
+            "company",
+            "business",
+        )
+        return not any(keyword in normalized for keyword in business_keywords)
+
+    return False
+
+
+def _build_refusal_text(agent_config: dict) -> str:
+    preferred_language = str(agent_config.get("stt_language") or agent_config.get("stt_locale") or "").strip()
+    if preferred_language.lower() == "hi-in":
+        return "माफ़ कीजिए, मैं केवल इस व्यवसाय से जुड़ी मदद कर सकता हूं। कृपया अपना सवाल काम से संबंधित रखें।"
+    if preferred_language.lower() == "mr-in":
+        return "माफ करा, मी फक्त या व्यवसायाशी संबंधित मदत करू शकतो. कृपया तुमचा प्रश्न कामाशी संबंधित ठेवा."
+
+    return "Sorry, I can only help with questions related to this business. Please keep your question work-related."
+
+
 async def _sse_generator(
     payload: QueryPayload,
     conversation_id: str,
@@ -323,6 +485,7 @@ async def _sse_generator(
         logger.info("[QUERY] response_complete conv=%s chunks=%d total_chars=%d", conversation_id, chunk_count, len(full))
         if full:
             await _save_message(conversation_id, "assistant", full)
+            await _mark_conversation_completed(conversation_id)
 
     except Exception as exc:
         logger.error("SSE error conv=%s: %s", conversation_id, exc, exc_info=True)

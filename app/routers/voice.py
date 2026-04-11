@@ -6,6 +6,8 @@ Not used by the dashboard or external developers.
 """
 
 import logging
+from html import escape
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
@@ -23,6 +25,9 @@ _TWIML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
   <Connect>
         <Stream url="{ws_url}">
             <Parameter name="agent_id" value="{agent_id}" />
+                        <Parameter name="From" value="{from_number}" />
+                        <Parameter name="To" value="{to_number}" />
+                        <Parameter name="CallSid" value="{call_sid}" />
         </Stream>
   </Connect>
 </Response>"""
@@ -95,10 +100,39 @@ async def twiml_webhook(
         logger.warning("TwiML: unknown/inactive agent_id=%s", agent_id)
         raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
 
-    ws_url = settings.ws_call_url
-    twiml = _TWIML_TEMPLATE.format(ws_url=ws_url, agent_id=agent_id)
+    form = await request.form() if request.method == "POST" else {}
+    from_number = str(form.get("From") or "")
+    to_number = str(form.get("To") or "")
+    call_sid = str(form.get("CallSid") or "")
+    if not from_number:
+        logger.warning("TwiML webhook missing From: agent_id=%s call_sid=%s", agent_id, call_sid)
 
-    logger.info("TwiML served: agent_id=%s", agent_id)
+    ws_url = _resolve_ws_call_url(request)
+    request_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    ws_host = urlparse(ws_url).netloc
+    if request_host and ws_host and request_host != ws_host:
+        logger.warning(
+            "TwiML host mismatch: request_host=%s ws_host=%s ws_url=%s",
+            request_host,
+            ws_host,
+            ws_url,
+        )
+
+    twiml = _TWIML_TEMPLATE.format(
+        ws_url=escape(ws_url, quote=True),
+        agent_id=escape(agent_id, quote=True),
+        from_number=escape(from_number, quote=True),
+        to_number=escape(to_number, quote=True),
+        call_sid=escape(call_sid, quote=True),
+    )
+
+    logger.info(
+        "TwiML served: agent_id=%s from=%s call_sid=%s ws_url=%s",
+        agent_id,
+        from_number,
+        call_sid,
+        ws_url,
+    )
     return Response(content=twiml, media_type="text/xml")
 
 
@@ -148,3 +182,27 @@ async def _agent_exists(agent_id: str) -> bool:
     except Exception as exc:
         logger.error("Agent existence check failed: %s", exc)
         return False
+
+
+def _resolve_ws_call_url(request: Request) -> str:
+    """
+    Resolve the Twilio <Stream> URL.
+
+    Priority:
+    1) Explicit WS_CALL_URL_OVERRIDE from env
+    2) Incoming forwarded host/proto (best for Cloudflare/ngrok tunnels)
+    3) Static PUBLIC_URL-derived fallback from settings
+    """
+    if settings.ws_call_url_override:
+        return settings.ws_call_url_override.strip()
+
+    forwarded_host = request.headers.get("x-forwarded-host")
+    host = forwarded_host or request.headers.get("host")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    scheme = (forwarded_proto or request.url.scheme or "https").lower()
+
+    if host:
+        ws_scheme = "wss" if scheme == "https" else "ws"
+        return f"{ws_scheme}://{host}/call"
+
+    return settings.ws_call_url

@@ -66,16 +66,49 @@ def _synthesize_blocking(text: str, voice: str) -> bytes | None:
     without needing a speaker device or file write.
     Returns raw mulaw bytes (or None on failure).
     """
+    return _synthesize_blocking_with_format(
+        text=text,
+        voice=voice,
+        output_format=speechsdk.SpeechSynthesisOutputFormat.Raw8Khz8BitMonoMULaw,
+    )
+
+
+async def synthesize_preview_wav(text: str, voice: str | None = None) -> bytes | None:
+    """
+    Synthesize browser-playable WAV preview audio for dashboard voice testing.
+    """
+    voice = voice or settings.tts_default_voice
+    text = text.strip()
+    if not text:
+        return None
+
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        _synthesize_preview_wav_blocking,
+        text,
+        voice,
+    )
+
+
+def _synthesize_preview_wav_blocking(text: str, voice: str) -> bytes | None:
+    return _synthesize_blocking_with_format(
+        text=text,
+        voice=voice,
+        output_format=speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm,
+    )
+
+
+def _synthesize_blocking_with_format(
+    text: str,
+    voice: str,
+    output_format: speechsdk.SpeechSynthesisOutputFormat,
+) -> bytes | None:
     speech_config = speechsdk.SpeechConfig(
         subscription=settings.azure_speech_key,
         region=settings.azure_speech_region,
     )
 
-    # Request mulaw 8kHz directly — Twilio's native format
-    # This avoids a PCM16→mulaw conversion step
-    speech_config.set_speech_synthesis_output_format(
-        speechsdk.SpeechSynthesisOutputFormat.Raw8Khz8BitMonoMULaw
-    )
+    speech_config.set_speech_synthesis_output_format(output_format)
 
     # Use a pull-stream to capture audio in memory
     pull_stream = speechsdk.audio.PullAudioOutputStream()
@@ -93,9 +126,7 @@ def _synthesize_blocking(text: str, voice: str) -> bytes | None:
 
     if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
         audio_data = result.audio_data
-        logger.debug(
-            "TTS synthesized %d bytes for: %s", len(audio_data), text[:60]
-        )
+        logger.debug("TTS synthesized %d bytes for: %s", len(audio_data), text[:60])
         return audio_data
     elif result.reason == speechsdk.ResultReason.Canceled:
         cancellation = speechsdk.SpeechSynthesisCancellationDetails(result)

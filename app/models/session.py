@@ -96,6 +96,11 @@ class SessionState:
     # Generates unique Twilio mark names: "sentence_0", "sentence_1", …
 
     # ── Lifecycle guard ────────────────────────────────────────────────────
+    shutdown_in_progress: bool = False
+    # Set True as soon as _handle_stop() starts.
+    # Lets late STT final callbacks record the last transcript without
+    # kicking off a new LLM/TTS response during teardown.
+
     stopped: bool = False
     # Set True the first time _handle_stop() runs.
     # Prevents double-execution when both the event branch (stop event) and

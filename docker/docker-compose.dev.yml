@@ -138,6 +138,8 @@ services:
         condition: service_healthy
     networks:
       - aicaller_dev_net
+    healthcheck:
+      disable: true
     deploy:
       resources:
         limits:
