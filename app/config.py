@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # server
     port: str = "8000"
     public_url: str = "https://api.iamspiderman.me"
+    ws_call_url_override: str | None = None
     secret_key: str = "secret"
     cors_origins: str = "*"
     log_file: str = "/app/logs/backend.log"
@@ -79,6 +80,8 @@ class Settings(BaseSettings):
     @property
     def ws_call_url(self) -> str:
         """Full WSS URL for Twilio stream — used in TwiML response."""
+        if self.ws_call_url_override:
+            return self.ws_call_url_override.strip()
         base = self.public_url.rstrip("/")
         return base.replace("https://", "wss://").replace("http://", "ws://") + "/call"
  

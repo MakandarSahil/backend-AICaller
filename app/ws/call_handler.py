@@ -259,9 +259,9 @@ async def _handle_stop(call_sid: str) -> None:
     session = get_session(call_sid)
     if not session:
         return  # Already cleaned up
-    if session.stopped:
+    if session.stopped or session.shutdown_in_progress:
         return  # Already running — do not double-execute
-    session.stopped = True
+    session.shutdown_in_progress = True
 
     logger.info("Call ending: call_sid=%s turns=%d", call_sid, len(session.conversation_history))
 
@@ -270,6 +270,17 @@ async def _handle_stop(call_sid: str) -> None:
         session.stt_recognizer.stop()
         session.stt_recognizer = None
 
+    # Give any late Azure final callback a chance to append the last turn.
+    await asyncio.sleep(0)
+
+    if session.stt_partial_text:
+        partial_text = session.stt_partial_text.strip()
+        session.stt_partial_text = ""
+        if partial_text:
+            _append_transcript_if_new(session, partial_text)
+
+    await asyncio.sleep(0.2)
+
     # Cancel any in-flight TTS
     if session.current_tts_cancel:
         try:
@@ -277,6 +288,8 @@ async def _handle_stop(call_sid: str) -> None:
         except Exception:
             pass
         session.current_tts_cancel = None
+
+    await _mark_conversation_completed(session)
 
     # Fire Celery task — persist messages + summary + update conversation row
     try:
@@ -292,6 +305,7 @@ async def _handle_stop(call_sid: str) -> None:
     except Exception as exc:
         logger.error("Failed to queue Celery task for call_sid=%s: %s", call_sid, exc)
 
+    session.stopped = True
     delete_session(call_sid)
 
 
@@ -318,16 +332,15 @@ async def _handle_final_transcript(
     if not text:
         return
 
-    # Ignore duplicate user transcript that can happen when a fallback partial
-    # commit is followed by a late Azure final callback with the same text.
-    if session.conversation_history:
-        last_turn = session.conversation_history[-1]
-        if last_turn.get("role") == "user":
-            last_text = " ".join(last_turn.get("content", "").strip().lower().split())
-            curr_text = " ".join(text.lower().split())
-            if last_text and curr_text and last_text == curr_text:
-                logger.debug("Duplicate transcript ignored [%s]: %s", session.call_sid, text)
-                return
+    if not _append_transcript_if_new(session, text):
+        return
+
+    if session.shutdown_in_progress:
+        logger.debug(
+            "Transcript recorded during shutdown — skipping response generation [%s]",
+            session.call_sid,
+        )
+        return
 
     # Guard: if already speaking (very fast back-to-back utterances), ignore
     if session.is_speaking:
@@ -336,7 +349,6 @@ async def _handle_final_transcript(
 
     logger.info("Transcript [%s]: %s", session.call_sid, text)
 
-    session.add_user_turn(text)
     session.is_speaking = True
     session.barge_in_loud_samples = 0
 
@@ -381,6 +393,24 @@ async def _handle_final_transcript(
         session.current_tts_cancel = None
         if full_response.strip():
             session.add_assistant_turn(full_response.strip())
+
+
+def _append_transcript_if_new(session: SessionState, text: str) -> bool:
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        return False
+
+    if session.conversation_history:
+        last_turn = session.conversation_history[-1]
+        if last_turn.get("role") == "user":
+            last_text = " ".join(last_turn.get("content", "").strip().lower().split())
+            curr_text = " ".join(cleaned_text.lower().split())
+            if last_text and curr_text and last_text == curr_text:
+                logger.debug("Duplicate transcript ignored [%s]: %s", session.call_sid, cleaned_text)
+                return False
+
+    session.add_user_turn(cleaned_text)
+    return True
 
 
 async def _stream_sentence_to_twilio(
@@ -495,6 +525,52 @@ async def _create_active_conversation(session: SessionState) -> str | None:
         return None
 
 
+async def _mark_conversation_completed(session: SessionState) -> None:
+    if not session.conversation_id:
+        return
+
+    try:
+        supabase = get_supabase()
+        await (
+            supabase.table("conversations")
+            .update(
+                {
+                    "status": "completed",
+                    "ended_at": "now()",
+                    "message_count": len(session.conversation_history),
+                }
+            )
+            .eq("id", session.conversation_id)
+            .execute()
+        )
+
+        try:
+            await (
+                supabase.table("conversations")
+                .update({"outcome": "hung_up"})
+                .eq("id", session.conversation_id)
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not set fallback outcome: conv_id=%s err=%s",
+                session.conversation_id,
+                exc,
+            )
+
+        logger.info(
+            "Conversation marked completed: conv_id=%s turns=%d",
+            session.conversation_id,
+            len(session.conversation_history),
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to mark conversation completed: conv_id=%s err=%s",
+            session.conversation_id,
+            exc,
+        )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse(raw: str) -> dict[str, Any] | None:
@@ -518,12 +594,21 @@ def _extract_caller_phone(start: dict) -> str:
     """
     # customParameters — set when using <Parameter> in TwiML
     custom = start.get("customParameters") or {}
-    if custom.get("From"):
-        return custom["From"]
+    for key in ("From", "from", "caller", "callerNumber"):
+        value = custom.get(key)
+        if value:
+            value_str = str(value)
+            # Twilio can send values like "client:alice" for client calls.
+            if value_str.startswith("client:"):
+                return ""
+            return value_str
     # Standard Twilio call metadata fields
-    for key in ("from", "From", "callerNumber"):
+    for key in ("from", "From", "caller", "callerNumber"):
         if start.get(key):
-            return start[key]
+            value_str = str(start[key])
+            if value_str.startswith("client:"):
+                return ""
+            return value_str
     return ""
 
 

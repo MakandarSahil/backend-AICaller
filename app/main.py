@@ -174,41 +174,6 @@ async def health():
         redis_status = f"error: {exc}"
     return {"status": "ok", "env": settings.env, "redis": redis_status}
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-app.include_router(voice.router, tags=["telephony"])
-app.include_router(query.router, tags=["query"])
-app.include_router(api_keys.router, tags=["api-keys"])
-
-
-@app.get(
-    "/health",
-    tags=["ops"],
-    summary="Health check",
-    response_description="Service status and Redis connectivity",
-    responses={
-        200: {
-            "description": "Service is healthy",
-            "content": {
-                "application/json": {
-                    "example": {"status": "ok", "env": "production", "redis": "ok"}
-                }
-            },
-        }
-    },
-)
-async def health():
-    """
-    Returns service status and Redis connectivity.
-    Used by Traefik, Docker HEALTHCHECK, and the CI/CD deploy gate.
-    """
-    from app.clients.redis import get_redis
-    try:
-        await get_redis().ping()
-        redis_status = "ok"
-    except Exception as exc:
-        redis_status = f"error: {exc}"
-    return {"status": "ok", "env": settings.env, "redis": redis_status}
-
 @app.get(
     "/",
     tags=["ops"],
