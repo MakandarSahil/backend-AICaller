@@ -47,6 +47,11 @@ class CreateKeyRequest(BaseModel):
         description="Human-readable label for this key",
         examples=["Website chatbot", "iOS app", "Partner integration"],
     )
+    allowed_domains: list[str] | None = Field(
+        default=None,
+        description="Optional list of allowed domains (e.g., ['example.com', '*.example.com']). Null = no restrictions.",
+        examples=[["example.com", "www.example.com"], ["*.example.com"]],
+    )
 
 
 class CreateKeyResponse(BaseModel):
@@ -70,6 +75,11 @@ class ApiKeyListItem(BaseModel):
     is_active: bool = Field(examples=[True])
     created_at: str = Field(examples=["2026-03-18T10:00:00+00:00"])
     last_used_at: str | None = Field(default=None, examples=["2026-03-18T12:34:56+00:00"])
+    allowed_domains: list[str] | None = Field(
+        default=None,
+        description="List of allowed domains. Null means no restrictions.",
+        examples=[["example.com"], ["*.example.com"]],
+    )
 
 
 class RevokeKeyResponse(BaseModel):
@@ -138,16 +148,22 @@ async def create_api_key(
 
     try:
         supabase = get_supabase()
+        insert_data = {
+            "workspace_id": auth.workspace_id,
+            "name": body.name.strip(),
+            "key_hash": key_hash,
+            "key_prefix": key_prefix,
+            "is_active": True,
+            "created_by": auth.identity_id,
+        }
+        
+        # Add allowed_domains if provided
+        if body.allowed_domains is not None:
+            insert_data["allowed_domains"] = body.allowed_domains
+        
         result = (
             await supabase.table("api_keys")
-            .insert({
-                "workspace_id": auth.workspace_id,
-                "name": body.name.strip(),
-                "key_hash": key_hash,
-                "key_prefix": key_prefix,
-                "is_active": True,
-                "created_by": auth.identity_id,
-            })
+            .insert(insert_data)
             .execute()
         )
     except Exception as exc:
@@ -210,7 +226,7 @@ async def list_api_keys(
         supabase = get_supabase()
         result = (
             await supabase.table("api_keys")
-            .select("id, name, key_prefix, is_active, created_at, last_used_at")
+            .select("id, name, key_prefix, is_active, created_at, last_used_at, allowed_domains")
             .eq("workspace_id", auth.workspace_id)
             .order("created_at", desc=True)
             .execute()
@@ -227,6 +243,7 @@ async def list_api_keys(
             is_active=row["is_active"],
             created_at=str(row["created_at"]),
             last_used_at=str(row["last_used_at"]) if row.get("last_used_at") else None,
+            allowed_domains=row.get("allowed_domains"),
         )
         for row in (result.data or [])
     ]
@@ -309,3 +326,136 @@ async def revoke_api_key(
 
     logger.info("API key revoked: id=%s workspace=%s", key_id, auth.workspace_id)
     return RevokeKeyResponse(id=key_id, revoked=True)
+
+
+class UpdateKeyRequest(BaseModel):
+    allowed_domains: list[str] | None = Field(
+        default=None,
+        description="List of allowed domains. Empty list or null means no restrictions.",
+        examples=[["example.com", "*.example.com"]],
+    )
+
+
+class UpdateKeyResponse(BaseModel):
+    id: str
+    name: str
+    key_prefix: str
+    is_active: bool
+    allowed_domains: list[str] | None
+    created_at: str
+    last_used_at: str | None
+
+
+@router.patch(
+    "/{key_id}",
+    response_model=UpdateKeyResponse,
+    summary="Update an API key",
+    response_description="Updated key details",
+    responses={
+        200: {
+            "description": "Key updated successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "id": "3f6e8a21-b2c3-4d5e-f6a7-890123456789",
+                        "name": "Website chatbot",
+                        "key_prefix": "cm_live_a1b2c3d4",
+                        "is_active": True,
+                        "allowed_domains": ["example.com", "*.example.com"],
+                        "created_at": "2026-03-18T10:00:00+00:00",
+                        "last_used_at": None,
+                    }
+                }
+            },
+        },
+        403: {
+            "description": "Not a JWT user, or key belongs to a different workspace",
+            "content": {"application/json": {"example": {"detail": "Not authorised to update this key"}}},
+        },
+        404: {
+            "description": "Key not found",
+            "content": {"application/json": {"example": {"detail": "API key not found"}}},
+        },
+    },
+)
+async def update_api_key(
+    key_id: str,
+    body: UpdateKeyRequest,
+    auth: AuthContext = Depends(get_auth_context),
+) -> UpdateKeyResponse:
+    """
+    Update an API key's configuration (e.g., allowed domains).
+
+    **JWT auth only.** You can only update keys belonging to your workspace.
+    
+    Use this to restrict where the API key can be used (e.g., only allow on your domain).
+    """
+    if auth.auth_type != "jwt":
+        raise HTTPException(
+            status_code=403,
+            detail="Only dashboard users (JWT auth) can update API keys",
+        )
+
+    try:
+        supabase = get_supabase()
+        check = (
+            await supabase.table("api_keys")
+            .select("id, workspace_id, name, key_prefix, is_active, created_at, last_used_at, allowed_domains")
+            .eq("id", key_id)
+            .single()
+            .execute()
+        )
+    except Exception:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    if not check.data:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    if check.data["workspace_id"] != auth.workspace_id:
+        raise HTTPException(status_code=403, detail="Not authorised to update this key")
+
+    # Build update data
+    update_data: dict = {}
+    if body.allowed_domains is not None:
+        update_data["allowed_domains"] = body.allowed_domains if body.allowed_domains else None
+
+    if not update_data:
+        # Nothing to update, return current state
+        return UpdateKeyResponse(
+            id=check.data["id"],
+            name=check.data["name"],
+            key_prefix=check.data["key_prefix"],
+            is_active=check.data["is_active"],
+            allowed_domains=check.data.get("allowed_domains"),
+            created_at=str(check.data["created_at"]),
+            last_used_at=str(check.data["last_used_at"]) if check.data.get("last_used_at") else None,
+        )
+
+    try:
+        supabase = get_supabase()
+        result = (
+            await supabase.table("api_keys")
+            .update(update_data)
+            .eq("id", key_id)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("Failed to update API key %s: %s", key_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to update API key")
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to update API key")
+
+    row = result.data[0]
+    
+    logger.info("API key updated: id=%s workspace=%s domains=%s", key_id, auth.workspace_id, body.allowed_domains)
+    
+    return UpdateKeyResponse(
+        id=row["id"],
+        name=row["name"],
+        key_prefix=row["key_prefix"],
+        is_active=row["is_active"],
+        allowed_domains=row.get("allowed_domains"),
+        created_at=str(row["created_at"]),
+        last_used_at=str(row["last_used_at"]) if row.get("last_used_at") else None,
+    )

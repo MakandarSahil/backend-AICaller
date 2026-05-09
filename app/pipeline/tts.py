@@ -54,8 +54,11 @@ async def synthesize_sentence(
     raw_mulaw = strip_riff_header(raw_audio)
 
     # Yield in Twilio-sized chunks
+    total_chunks = 0
     for i in range(0, len(raw_mulaw), _CHUNK_SIZE):
         yield raw_mulaw[i : i + _CHUNK_SIZE]
+        total_chunks += 1
+    logger.debug("TTS yielded %d chunks for: %s", total_chunks, text[:60])
 
 
 def _synthesize_blocking(text: str, voice: str) -> bytes | None:

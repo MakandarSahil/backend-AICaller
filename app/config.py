@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # twilio
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
+    
+    # encryption for credential storage (BYO Twilio, etc.)
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    encryption_key: str = ""
 
     # azure
     azure_speech_key: str

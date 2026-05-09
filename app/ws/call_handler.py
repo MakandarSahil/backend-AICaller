@@ -425,6 +425,7 @@ async def _stream_sentence_to_twilio(
     voice = session.agent_config.get("tts_voice") or settings.tts_default_voice
     cancelled = False
     cancel_event = asyncio.Event()
+    chunks_sent = 0
 
     def cancel() -> None:
         nonlocal cancelled
@@ -434,8 +435,10 @@ async def _stream_sentence_to_twilio(
     session.current_tts_cancel = cancel
 
     try:
+        logger.info("TTS streaming started [%s]: sentence=%r voice=%s", session.call_sid, sentence[:60], voice)
         async for mulaw_chunk in synthesize_sentence(sentence, voice):
             if cancel_event.is_set():
+                logger.debug("TTS cancelled mid-stream [%s]", session.call_sid)
                 break
 
             # Check WS still open (connection might drop mid-sentence)
@@ -450,6 +453,9 @@ async def _stream_sentence_to_twilio(
                 "streamSid": session.stream_sid,
                 "media": {"payload": b64},
             })
+            chunks_sent += 1
+
+        logger.info("TTS streaming complete [%s]: chunks_sent=%d cancelled=%s", session.call_sid, chunks_sent, cancelled)
 
         if not cancelled:
             mark_name = session.next_mark_name()
@@ -459,6 +465,7 @@ async def _stream_sentence_to_twilio(
                 "streamSid": session.stream_sid,
                 "mark": {"name": mark_name},
             })
+            logger.debug("TTS mark sent [%s]: %s", session.call_sid, mark_name)
 
     except Exception as exc:
         logger.error("TTS stream error [%s]: %s", session.call_sid, exc, exc_info=True)

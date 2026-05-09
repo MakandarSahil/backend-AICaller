@@ -30,3 +30,4 @@ twilio==9.3.6                      # Twilio helper lib (webhook validation etc.)
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1               # .env loading (pydantic-settings uses this)
+cryptography==42.0.8               # Encryption for credential storage (Fernet)
