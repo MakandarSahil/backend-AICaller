@@ -732,3 +732,44 @@ order by table_name;
 -- profiles, workspaces, knowledge_bases, kb_documents, agents,
 -- agent_knowledge_bases, number_pool, phone_numbers, callers,
 -- conversations, messages, agent_usage, api_keys
+
+
+DROP TRIGGER IF EXISTS on_agent_created ON agents;
+DROP FUNCTION IF EXISTS handle_new_agent();
+
+   
+
+--twilio setup
+INSERT INTO number_pool (number, provider, provider_sid, is_assigned, webhook_configured)
+SELECT w.id as workspace_id, a.id as agent_id, a.name
+FROM workspaces w
+JOIN agents a ON a.workspace_id = w.id
+WHERE w.owner_id = '97952640-62ba-4a87-b948-063fabe3e50f';
+
+INSERT INTO phone_numbers (workspace_id, agent_id, number, number_type, provider, webhook_url, is_active)
+VALUES (
+  '54065171-1a04-4e80-a295-9e44722cd58d',
+  '9600fc18-c15c-4ecd-8617-5e4462dc34bf',
+  '+16812666988',
+  'platform',
+  'twilio',
+  'https://api.iamspiderman.in/voice?agent_id=9600fc18-c15c-4ecd-8617-5e4462dc34bf',
+  true
+);
+
+UPDATE phone_numbers
+SET webhook_url = 'https://api.iamspiderman.me/voice?agent_id=9600fc18-c15c-4ecd-8617-5e4462dc34bf'
+WHERE number = '+16812666988';
+UPDATE number_pool
+SET 
+  assigned_to = '54065171-1a04-4e80-a295-9e44722cd58d',
+  provider_sid = 'PN0dd8551dbfd3055527250da4bf9102b4' -- your real Twilio Phone SID
+WHERE number = '+16812666988';
+
+
+UPDATE phone_numbers
+SET provider_sid = 'PN0dd8551dbfd3055527250da4bf9102b4'
+WHERE number = '+16812666988';
+
+select * from number_pool;
+select * from phone_numbers;

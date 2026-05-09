@@ -2,8 +2,8 @@
 app/routers/query.py — POST /query
 
 The shared text pipeline endpoint. Used by:
-    1. Dashboard chat (Supabase JWT auth)
-    2. External chatbot integrations (API key auth)
+    1. Dashboard chat (Supabase JWT auth) - X-Source: dashboard_test (no persistence)
+    2. External chatbot integrations (API key auth) - X-Source: widget|api (full persistence + analytics)
 
 Pipeline: text -> KB + history -> build_prompt -> Groq -> SSE or JSON
 No STT, no TTS.
@@ -15,7 +15,7 @@ import logging
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -25,6 +25,7 @@ from app.models.query import Channel, QueryPayload, TextQueryRequest, TextQueryR
 from app.pipeline.llm import stream_llm_full, stream_llm_sentences
 from app.pipeline.tts import synthesize_preview_wav
 from app.pipeline.session import load_agent_config, load_kb_documents
+from app.tasks.conversation import save_text_conversation
 
 router = APIRouter(tags=["query"])
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ class TTSPreviewRequest(BaseModel):
 )
 async def text_query(
     request: TextQueryRequest,
+    http_request: Request,
     auth: AuthContext = Depends(get_auth_context),
 ):
     """
@@ -136,13 +138,26 @@ async def text_query(
     Auth options (either works):
     - Dashboard users -> Authorization: Bearer <supabase_jwt>
     - External developers -> Authorization: Bearer cm_live_xxx or X-API-Key: cm_live_xxx
+
+    Source tracking via X-Source header:
+    - X-Source: dashboard_test -> No DB persistence (for dashboard testing)
+    - X-Source: widget|api -> Full persistence + analytics
+    - No header -> Treated as external API usage
     """
+    # Get source from header
+    source = http_request.headers.get("X-Source", "api")
+    is_test_mode = source == "dashboard_test"
+
+    user_name = request.user.name if request.user else None
     logger.info(
-        "[QUERY] start agent=%s conv=%s visitor=%s stream=%s text=%r",
+        "[QUERY] start agent=%s conv=%s visitor=%s user=%s stream=%s source=%s test=%s text=%r",
         request.agent_id,
         request.conversation_id or "new",
         request.visitor_id or "anonymous",
+        user_name or "anonymous",
         request.stream,
+        source,
+        is_test_mode,
         request.text[:100] if len(request.text) > 100 else request.text,
     )
 
@@ -168,18 +183,38 @@ async def text_query(
         sum(len(doc) for doc in kb_documents),
     )
 
-    conversation_id, conversation_history = await _get_or_create_conversation(
-        agent_id=request.agent_id,
-        conversation_id=request.conversation_id,
-        auth=auth,
-        visitor_id=request.visitor_id,
-    )
-    logger.info(
-        "[QUERY] conversation_ready id=%s history_turns=%d existing=%s",
-        conversation_id,
-        len(conversation_history),
-        bool(request.conversation_id),
-    )
+    # For test mode, use in-memory conversation tracking only
+    if is_test_mode:
+        conversation_id = request.conversation_id or str(uuid4())
+        conversation_history = []
+
+        # Load existing history if continuing a test conversation
+        if request.conversation_id:
+            # In test mode, we don't persist, so history is empty after page refresh
+            # But we can support multi-turn within the same session
+            pass
+
+        logger.info(
+            "[QUERY] test_mode_conv id=%s history_turns=%d",
+            conversation_id,
+            len(conversation_history),
+        )
+    else:
+        # Full persistence mode
+        user_info_dict = request.user.model_dump() if request.user else None
+        conversation_id, conversation_history = await _get_or_create_conversation(
+            agent_id=request.agent_id,
+            conversation_id=request.conversation_id,
+            auth=auth,
+            visitor_id=request.visitor_id,
+            user_info=user_info_dict,
+        )
+        logger.info(
+            "[QUERY] conversation_ready id=%s history_turns=%d existing=%s",
+            conversation_id,
+            len(conversation_history),
+            bool(request.conversation_id),
+        )
 
     visitor_history = await _load_visitor_history(
         visitor_id=request.visitor_id,
@@ -189,9 +224,12 @@ async def text_query(
 
     if _is_obviously_off_topic(request.text):
         refusal_text = _build_refusal_text(agent_config)
-        await _save_message(conversation_id, "user", request.text)
-        await _save_message(conversation_id, "assistant", refusal_text)
-        await _mark_conversation_completed(conversation_id)
+
+        if not is_test_mode:
+            await _save_message(conversation_id, "user", request.text)
+            await _save_message(conversation_id, "assistant", refusal_text)
+            await _mark_conversation_completed(conversation_id)
+
         logger.info("[QUERY] off_topic_refusal agent=%s conv=%s", request.agent_id, conversation_id)
         return TextQueryResponse(
             text=refusal_text,
@@ -219,11 +257,12 @@ async def text_query(
         len(visitor_history),
     )
 
-    await _save_message(conversation_id, "user", request.text)
+    if not is_test_mode:
+        await _save_message(conversation_id, "user", request.text)
 
     if request.stream:
         return StreamingResponse(
-            _sse_generator(payload, conversation_id),
+            _sse_generator(payload, conversation_id, is_test_mode, source),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -231,9 +270,20 @@ async def text_query(
             },
         )
 
+    # Non-streaming mode
     full_text = await stream_llm_full(payload)
-    await _save_message(conversation_id, "assistant", full_text)
-    await _mark_conversation_completed(conversation_id)
+
+    if not is_test_mode:
+        await _save_message(conversation_id, "assistant", full_text)
+        await _mark_conversation_completed(conversation_id)
+
+        # Fire analytics task for real usage
+        save_text_conversation.delay(
+            agent_id=request.agent_id,
+            conversation_id=conversation_id,
+            source=source,
+        )
+
     return TextQueryResponse(
         text=full_text,
         conversation_id=conversation_id,
@@ -302,6 +352,7 @@ async def _get_or_create_conversation(
     conversation_id: str | None,
     auth: AuthContext,
     visitor_id: str | None,
+    user_info: dict | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     supabase = get_supabase()
 
@@ -342,6 +393,16 @@ async def _get_or_create_conversation(
     }
     if visitor_id:
         conv_payload["visitor_id"] = visitor_id
+    
+    # Store user info metadata if provided (requires metadata column in conversations table)
+    if user_info:
+        # For now, log user info. In future, add metadata column to conversations table
+        logger.info(
+            "[QUERY] user_info name=%s email=%s user_id=%s",
+            user_info.get("name") or "N/A",
+            user_info.get("email") or "N/A",
+            user_info.get("user_id") or "N/A",
+        )
 
     result = await supabase.table("conversations").insert(conv_payload).execute()
     new_id = result.data[0]["id"] if result.data else None
@@ -457,7 +518,10 @@ def _build_refusal_text(agent_config: dict) -> str:
 async def _sse_generator(
     payload: QueryPayload,
     conversation_id: str,
+    is_test_mode: bool = False,
+    source: str = "api",
 ) -> AsyncGenerator[str, None]:
+    """Generate SSE stream. Optionally skip persistence for test mode."""
     response_parts: list[str] = []
     first_chunk = True
     chunk_count = 0
@@ -482,10 +546,19 @@ async def _sse_generator(
         yield "data: [DONE]\n\n"
 
         full = " ".join(response_parts).strip()
-        logger.info("[QUERY] response_complete conv=%s chunks=%d total_chars=%d", conversation_id, chunk_count, len(full))
-        if full:
+        logger.info("[QUERY] response_complete conv=%s chunks=%d total_chars=%d test=%s", conversation_id, chunk_count, len(full), is_test_mode)
+
+        if full and not is_test_mode:
+            # Save message and trigger analytics for real usage
             await _save_message(conversation_id, "assistant", full)
             await _mark_conversation_completed(conversation_id)
+
+            # Fire Celery task for analytics (summary, outcome, sentiment)
+            save_text_conversation.delay(
+                agent_id=payload.agent_id,
+                conversation_id=conversation_id,
+                source=source,
+            )
 
     except Exception as exc:
         logger.error("SSE error conv=%s: %s", conversation_id, exc, exc_info=True)
