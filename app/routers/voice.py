@@ -110,7 +110,7 @@ async def twiml_webhook(
     
     # Validate Twilio signature with appropriate credentials
     if settings.is_production and auth_token:
-        if not await _validate_twilio_signature(request, auth_token):
+        if not await _validate_twilio_signature(request, auth_token, agent_id):
             logger.warning(
                 "Twilio signature FAILED: agent_id=%s ip=%s is_byo=%s",
                 agent_id,
@@ -158,7 +158,7 @@ async def twiml_webhook(
     return Response(content=twiml, media_type="text/xml")
 
 
-async def _validate_twilio_signature(request: Request, auth_token: str | None = None) -> bool:
+async def _validate_twilio_signature(request: Request, auth_token: str | None = None, agent_id: str | None = None) -> bool:
     """Validate Twilio request signature using platform or BYO credentials."""
     try:
         from twilio.request_validator import RequestValidator
@@ -169,26 +169,46 @@ async def _validate_twilio_signature(request: Request, auth_token: str | None = 
             return False
         
         signature = request.headers.get("X-Twilio-Signature", "")
-        # Twilio signs the public webhook URL. Behind Traefik, request.url can be
-        # internal unless forwarded headers are respected, so reconstruct safely.
+        
+        # Twilio signs the public webhook URL with query params.
+        # Behind Traefik, request.url can be internal unless forwarded headers are respected.
+        # We MUST include the agent_id query param as Twilio signed the full URL.
         forwarded_proto = request.headers.get("x-forwarded-proto")
         forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        
+        # Build query string - MUST include agent_id as Twilio signs the full URL
+        query_parts = []
+        if agent_id:
+            query_parts.append(f"agent_id={agent_id}")
+        # Also include any other query params from the original URL
+        if request.url.query and "agent_id" not in str(request.url.query):
+            query_parts.append(str(request.url.query))
+        
+        query = "?" + "&".join(query_parts) if query_parts else ""
+        
         if forwarded_proto and forwarded_host:
-            query = f"?{request.url.query}" if request.url.query else ""
             url = f"{forwarded_proto}://{forwarded_host}{request.url.path}{query}"
         else:
-            url = str(request.url)
+            url = f"{request.url}{query}"
 
         params = dict(await request.form()) if request.method == "POST" else {}
+        
+        logger.debug(
+            "Twilio signature validation: url=%s signature=%s params=%s",
+            url,
+            signature[:20] + "..." if signature else "None",
+            list(params.keys())
+        )
+        
         is_valid = RequestValidator(token).validate(url, params, signature)
         if not is_valid:
             logger.warning(
-                "Twilio signature mismatch: method=%s host=%s fwd_host=%s fwd_proto=%s path=%s",
+                "Twilio signature mismatch: url=%s method=%s host=%s fwd_host=%s fwd_proto=%s",
+                url,
                 request.method,
                 request.headers.get("host"),
                 request.headers.get("x-forwarded-host"),
                 request.headers.get("x-forwarded-proto"),
-                request.url.path,
             )
         return is_valid
     except Exception as exc:
