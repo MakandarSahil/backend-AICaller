@@ -172,7 +172,7 @@ async def health():
         redis_status = "ok"
     except Exception as exc:
         redis_status = f"error: {exc}"
-    return {"status": "ok", "env": settings.env, "redis": redis_status}
+    return {"status": "ok", "env": settings.env, "redis": redis_status, "message": "Hi i am sahil makandar you can reach me at sahilmakandar15@gmail.com"}
 
 @app.get(
     "/",
