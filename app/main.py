@@ -11,7 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from app.clients.redis import init_redis, close_redis
 from app.clients.supabase import init_supabase, close_supabase
 from app.config import get_settings
-from app.routers import voice, query, api_keys
+from app.routers import voice, query, api_keys, telephony
 from app.ws.call_handler import handle_call
 
 settings = get_settings()
@@ -141,6 +141,7 @@ app.add_middleware(
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 app.include_router(voice.router, tags=["telephony"])
+app.include_router(telephony.router)
 app.include_router(query.router, tags=["query"])
 app.include_router(api_keys.router, tags=["api-keys"])
 

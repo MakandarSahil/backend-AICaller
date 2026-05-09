@@ -3,6 +3,11 @@ app/routers/voice.py — /voice
 
 Twilio webhook. Called automatically when a call arrives on a configured number.
 Not used by the dashboard or external developers.
+
+BYO Twilio Support:
+- Detects if the called number belongs to a connected provider
+- Uses provider-specific credentials for webhook validation
+- Falls back to platform credentials for platform numbers
 """
 
 import logging
@@ -87,12 +92,30 @@ async def twiml_webhook(
     checks the agent is active, and returns TwiML that tells Twilio to open
     a WebSocket stream to `/call?agent_id={uuid}`.
     """
-    if settings.is_production and settings.twilio_auth_token:
-        if not await _validate_twilio_signature(request):
+    # Get the called number from form data (available in POST requests)
+    form = await request.form() if request.method == "POST" else {}
+    to_number = str(form.get("To") or "")
+    
+    # Determine which credentials to use for validation
+    auth_token = settings.twilio_auth_token
+    is_byo = False
+    
+    if to_number:
+        # Look up if this is a BYO number
+        provider_creds = await _get_provider_credentials_for_number(to_number)
+        if provider_creds:
+            auth_token = provider_creds["auth_token"]
+            is_byo = True
+            logger.info("Using BYO Twilio credentials for number=%s", to_number)
+    
+    # Validate Twilio signature with appropriate credentials
+    if settings.is_production and auth_token:
+        if not await _validate_twilio_signature(request, auth_token):
             logger.warning(
-                "Twilio signature FAILED: agent_id=%s ip=%s",
+                "Twilio signature FAILED: agent_id=%s ip=%s is_byo=%s",
                 agent_id,
                 request.client.host if request.client else "unknown",
+                is_byo,
             )
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
@@ -100,9 +123,8 @@ async def twiml_webhook(
         logger.warning("TwiML: unknown/inactive agent_id=%s", agent_id)
         raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
 
-    form = await request.form() if request.method == "POST" else {}
+    # Use form data already fetched above
     from_number = str(form.get("From") or "")
-    to_number = str(form.get("To") or "")
     call_sid = str(form.get("CallSid") or "")
     if not from_number:
         logger.warning("TwiML webhook missing From: agent_id=%s call_sid=%s", agent_id, call_sid)
@@ -136,9 +158,16 @@ async def twiml_webhook(
     return Response(content=twiml, media_type="text/xml")
 
 
-async def _validate_twilio_signature(request: Request) -> bool:
+async def _validate_twilio_signature(request: Request, auth_token: str | None = None) -> bool:
+    """Validate Twilio request signature using platform or BYO credentials."""
     try:
         from twilio.request_validator import RequestValidator
+        
+        token = auth_token or settings.twilio_auth_token
+        if not token:
+            logger.warning("No Twilio auth token available for validation")
+            return False
+        
         signature = request.headers.get("X-Twilio-Signature", "")
         # Twilio signs the public webhook URL. Behind Traefik, request.url can be
         # internal unless forwarded headers are respected, so reconstruct safely.
@@ -151,7 +180,7 @@ async def _validate_twilio_signature(request: Request) -> bool:
             url = str(request.url)
 
         params = dict(await request.form()) if request.method == "POST" else {}
-        is_valid = RequestValidator(settings.twilio_auth_token).validate(url, params, signature)
+        is_valid = RequestValidator(token).validate(url, params, signature)
         if not is_valid:
             logger.warning(
                 "Twilio signature mismatch: method=%s host=%s fwd_host=%s fwd_proto=%s path=%s",
@@ -165,6 +194,93 @@ async def _validate_twilio_signature(request: Request) -> bool:
     except Exception as exc:
         logger.error("Twilio signature validation error: %s", exc)
         return False
+
+
+async def _get_provider_credentials_for_number(phone_number: str) -> dict | None:
+    """
+    Get Twilio credentials for a BYO phone number.
+    
+    Returns {"account_sid": str, "auth_token": str} if BYO, None if platform number.
+    """
+    try:
+        supabase = get_supabase()
+        
+        # Look up the phone number
+        result = (
+            await supabase.table("phone_numbers")
+            .select("telephony_provider_id")
+            .eq("number", phone_number)
+            .eq("is_active", True)
+            .maybe_single()
+            .execute()
+        )
+        
+        if not result.data:
+            logger.debug("Phone number not found: %s", phone_number)
+            return None
+        
+        provider_id = result.data.get("telephony_provider_id")
+        if not provider_id:
+            # No provider = platform number
+            logger.debug("Using platform credentials for number: %s", phone_number)
+            return None
+        
+        # Get provider record
+        provider_result = (
+            await supabase.table("workspace_telephony_providers")
+            .select("vault_secret_id, provider")
+            .eq("id", provider_id)
+            .eq("is_active", True)
+            .single()
+            .execute()
+        )
+        
+        if not provider_result.data:
+            logger.warning("Provider not found or inactive: %s", provider_id)
+            return None
+        
+        vault_secret_id = provider_result.data.get("vault_secret_id")
+        if not vault_secret_id:
+            logger.warning("No vault secret for provider: %s", provider_id)
+            return None
+        
+        # Retrieve encrypted credentials from provider_secrets table
+        secret_result = await supabase.table("provider_secrets")\
+            .select("encrypted_data")\
+            .eq("id", vault_secret_id)\
+            .single()\
+            .execute()
+        
+        if not secret_result.data or not secret_result.data.get("encrypted_data"):
+            logger.error("Failed to retrieve credentials: %s", vault_secret_id)
+            return None
+        
+        # Decrypt credentials
+        try:
+            credentials = await _decrypt_credentials(secret_result.data["encrypted_data"])
+            return {
+                "account_sid": credentials.get("account_sid"),
+                "auth_token": credentials.get("auth_token"),
+            }
+        except Exception as decrypt_error:
+            logger.error("Failed to decrypt credentials: %s", decrypt_error)
+            return None
+        
+    except Exception as exc:
+        logger.error("Error getting provider credentials: %s", exc)
+        return None
+
+
+async def _decrypt_credentials(ciphertext: str) -> dict:
+    """Decrypt base64-encoded ciphertext and return credentials dictionary."""
+    import json
+    from base64 import b64decode
+    from cryptography.fernet import Fernet
+    
+    cipher = Fernet(settings.encryption_key.encode())
+    encrypted = b64decode(ciphertext.encode())
+    decrypted = cipher.decrypt(encrypted)
+    return json.loads(decrypted.decode())
 
 
 async def _agent_exists(agent_id: str) -> bool:

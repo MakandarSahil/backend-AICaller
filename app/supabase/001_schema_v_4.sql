@@ -679,6 +679,33 @@ where allowed_domains is null;
 
 
 -- =============================================================================
+-- PROVIDER SECRETS FALLBACK TABLE (For when Supabase Vault is unavailable)
+-- =============================================================================
+-- Stores encrypted provider credentials when Vault extension is not enabled.
+-- This is a fallback - Vault is preferred when available.
+-- =============================================================================
+
+create table if not exists provider_secrets (
+  id text primary key,
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  provider text not null,
+  encrypted_data text not null,  -- base64 encoded credentials
+  created_at timestamptz not null default now()
+);
+
+comment on table provider_secrets is 
+  'Fallback secure storage for telephony provider credentials when Vault unavailable. 
+   Credentials are encrypted, not plaintext. Delete rows when Vault is enabled.';
+
+-- RLS for provider_secrets
+alter table provider_secrets enable row level security;
+
+create policy "provider_secrets: workspace only"
+  on provider_secrets for all
+  using (workspace_id = my_workspace_id())
+  with check (workspace_id = my_workspace_id());
+
+-- =============================================================================
 -- UPDATED VERIFICATION (includes api_keys check)
 -- =============================================================================
 
@@ -689,3 +716,10 @@ where table_schema = 'public'
   and table_name = 'api_keys'
   and column_name = 'allowed_domains';
 -- Expected: 1 row (data_type = ARRAY)
+
+-- Check provider_secrets table exists
+select table_name
+from information_schema.tables
+where table_schema = 'public'
+  and table_name = 'provider_secrets';
+-- Expected: 1 row
