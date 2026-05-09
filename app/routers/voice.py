@@ -92,9 +92,15 @@ async def twiml_webhook(
     checks the agent is active, and returns TwiML that tells Twilio to open
     a WebSocket stream to `/call?agent_id={uuid}`.
     """
-    # Get the called number from form data (available in POST requests)
-    form = await request.form() if request.method == "POST" else {}
-    to_number = str(form.get("To") or "")
+    # Read form data ONCE - it's a stream and can only be consumed once
+    form_data = {}
+    if request.method == "POST":
+        try:
+            form_data = dict(await request.form())
+        except Exception as form_error:
+            logger.warning("Could not read form data: %s", form_error)
+    
+    to_number = str(form_data.get("To") or "")
     
     # Determine which credentials to use for validation
     auth_token = settings.twilio_auth_token
@@ -110,7 +116,7 @@ async def twiml_webhook(
     
     # Validate Twilio signature with appropriate credentials
     if settings.is_production and auth_token:
-        if not await _validate_twilio_signature(request, auth_token, agent_id):
+        if not await _validate_twilio_signature(request, auth_token, agent_id, form_data):
             logger.warning(
                 "Twilio signature FAILED: agent_id=%s ip=%s is_byo=%s",
                 agent_id,
@@ -158,7 +164,7 @@ async def twiml_webhook(
     return Response(content=twiml, media_type="text/xml")
 
 
-async def _validate_twilio_signature(request: Request, auth_token: str | None = None, agent_id: str | None = None) -> bool:
+async def _validate_twilio_signature(request: Request, auth_token: str | None = None, agent_id: str | None = None, form_data: dict | None = None) -> bool:
     """Validate Twilio request signature using platform or BYO credentials."""
     try:
         from twilio.request_validator import RequestValidator
@@ -170,45 +176,39 @@ async def _validate_twilio_signature(request: Request, auth_token: str | None = 
         
         signature = request.headers.get("X-Twilio-Signature", "")
         
-        # Twilio signs the public webhook URL with query params.
-        # Behind Traefik, request.url can be internal unless forwarded headers are respected.
-        # We MUST include the agent_id query param as Twilio signed the full URL.
+        # CRITICAL: For POST requests, Twilio signs the URL WITHOUT query parameters!
+        # The agent_id and other params are sent in the form body.
+        # See: https://www.twilio.com/docs/usage/security#validating-requests
         forwarded_proto = request.headers.get("x-forwarded-proto")
         forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         
-        # Build query string - MUST include agent_id as Twilio signs the full URL
-        query_parts = []
-        if agent_id:
-            query_parts.append(f"agent_id={agent_id}")
-        # Also include any other query params from the original URL
-        if request.url.query and "agent_id" not in str(request.url.query):
-            query_parts.append(str(request.url.query))
-        
-        query = "?" + "&".join(query_parts) if query_parts else ""
-        
         if forwarded_proto and forwarded_host:
-            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}{query}"
+            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}"
         else:
-            url = f"{request.url}{query}"
+            # Use base URL without query string
+            url = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
 
-        params = dict(await request.form()) if request.method == "POST" else {}
+        # Use provided form data (prevents double-reading the stream)
+        if form_data is not None:
+            params = form_data
+        else:
+            params = dict(await request.form()) if request.method == "POST" else {}
         
-        logger.debug(
-            "Twilio signature validation: url=%s signature=%s params=%s",
+        logger.info(
+            "Twilio signature validation: url=%s method=%s signature_present=%s params=%s",
             url,
-            signature[:20] + "..." if signature else "None",
+            request.method,
+            bool(signature),
             list(params.keys())
         )
         
         is_valid = RequestValidator(token).validate(url, params, signature)
         if not is_valid:
             logger.warning(
-                "Twilio signature mismatch: url=%s method=%s host=%s fwd_host=%s fwd_proto=%s",
+                "Twilio signature mismatch: url=%s method=%s params=%s",
                 url,
                 request.method,
-                request.headers.get("host"),
-                request.headers.get("x-forwarded-host"),
-                request.headers.get("x-forwarded-proto"),
+                params
             )
         return is_valid
     except Exception as exc:
@@ -222,21 +222,30 @@ async def _get_provider_credentials_for_number(phone_number: str) -> dict | None
     
     Returns {"account_sid": str, "auth_token": str} if BYO, None if platform number.
     """
+    if not phone_number:
+        logger.debug("No phone number provided, using platform credentials")
+        return None
+    
     try:
         supabase = get_supabase()
         
         # Look up the phone number
-        result = (
-            await supabase.table("phone_numbers")
-            .select("telephony_provider_id")
-            .eq("number", phone_number)
-            .eq("is_active", True)
-            .maybe_single()
-            .execute()
-        )
+        # Note: Using .filter() instead of .eq() for is_active to avoid case issues
+        try:
+            result = (
+                await supabase.table("phone_numbers")
+                .select("telephony_provider_id, number_type")
+                .eq("number", phone_number)
+                .eq("is_active", True)
+                .maybe_single()
+                .execute()
+            )
+        except Exception as query_error:
+            logger.warning("Phone number query failed for %s: %s. Using platform credentials.", phone_number, query_error)
+            return None
         
-        if not result.data:
-            logger.debug("Phone number not found: %s", phone_number)
+        if not result or not result.data:
+            logger.debug("Phone number not found or query returned no data: %s", phone_number)
             return None
         
         provider_id = result.data.get("telephony_provider_id")
