@@ -239,6 +239,7 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
             hostname = origin
     except Exception:
         return False
+    hostname = hostname.lower().strip().rstrip(".")
     
     # Always allow localhost for development
     if hostname in ("localhost", "127.0.0.1", "::1"):
@@ -247,6 +248,7 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
     for allowed in allowed_domains:
         if not allowed:
             continue
+        allowed = allowed.lower().strip().rstrip(".")
             
         # Exact match
         if hostname == allowed:
@@ -255,7 +257,7 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
         # Wildcard match: *.example.com
         if allowed.startswith("*."):
             suffix = allowed[2:]  # Remove "*."
-            if hostname.endswith(suffix) and hostname != suffix:
+            if hostname.endswith(f".{suffix}"):
                 return True
         
         # Handle www subdomain automatically

@@ -282,6 +282,12 @@ async def verify_provider(
     
     Retrieves credentials from Vault and makes a test API call.
     """
+    if auth.auth_type != "jwt":
+        raise HTTPException(
+            status_code=403,
+            detail="Only dashboard users can verify providers",
+        )
+
     # Get credentials from Vault
     creds = await _get_credentials_from_vault(provider_id, auth.workspace_id)
     if not creds:

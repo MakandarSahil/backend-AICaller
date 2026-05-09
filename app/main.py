@@ -304,12 +304,19 @@ def custom_openapi():
 
     protected_paths = {
         "/query": ["post"],
+        "/query/tts-preview": ["post"],
         "/api-keys": ["get", "post"],
-        "/api-keys/{key_id}": ["delete"],
+        "/api-keys/{key_id}": ["delete", "patch"],
+        "/telephony/providers": ["get", "post"],
+        "/telephony/providers/{provider_id}/verify": ["post"],
+        "/telephony/providers/{provider_id}": ["delete"],
     }
     jwt_only_paths = {
         "/api-keys": ["post"],
-        "/api-keys/{key_id}": ["delete"],
+        "/api-keys/{key_id}": ["delete", "patch"],
+        "/telephony/providers": ["post"],
+        "/telephony/providers/{provider_id}/verify": ["post"],
+        "/telephony/providers/{provider_id}": ["delete"],
     }
 
     for path, methods in (schema.get("paths") or {}).items():
