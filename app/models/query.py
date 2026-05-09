@@ -107,6 +107,23 @@ class QueryPayload(BaseModel):
     )
 
 
+class UserInfo(BaseModel):
+    """User information passed from parent platform via widget."""
+    name: str | None = Field(default=None, description="User's display name")
+    email: str | None = Field(default=None, description="User's email address")
+    user_id: str | None = Field(default=None, description="Platform's user ID")
+    phone: str | None = Field(default=None, description="User's phone number")
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"name": "John Doe", "email": "john@example.com", "user_id": "user_123"},
+                {"name": "Anonymous", "user_id": "anon_456"},
+            ]
+        }
+    }
+
+
 class TextQueryRequest(BaseModel):
     """
     Request body for POST /query (REST text endpoint).
@@ -135,6 +152,14 @@ class TextQueryRequest(BaseModel):
             "Optional. For external chatbot widgets: a stable ID for this visitor "
             "(e.g. UUID stored in localStorage). Enables conversation history across "
             "sessions on the same browser. Not needed for dashboard chat."
+        ),
+    )
+    user: UserInfo | None = Field(
+        default=None,
+        description=(
+            "Optional user information from the parent platform. "
+            "Passed via window.callmindConfig.user in widget. "
+            "Includes name, email, user_id, phone for personalized responses."
         ),
     )
 

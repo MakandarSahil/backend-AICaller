@@ -148,11 +148,13 @@ async def text_query(
     source = http_request.headers.get("X-Source", "api")
     is_test_mode = source == "dashboard_test"
 
+    user_name = request.user.name if request.user else None
     logger.info(
-        "[QUERY] start agent=%s conv=%s visitor=%s stream=%s source=%s test=%s text=%r",
+        "[QUERY] start agent=%s conv=%s visitor=%s user=%s stream=%s source=%s test=%s text=%r",
         request.agent_id,
         request.conversation_id or "new",
         request.visitor_id or "anonymous",
+        user_name or "anonymous",
         request.stream,
         source,
         is_test_mode,
@@ -199,11 +201,13 @@ async def text_query(
         )
     else:
         # Full persistence mode
+        user_info_dict = request.user.model_dump() if request.user else None
         conversation_id, conversation_history = await _get_or_create_conversation(
             agent_id=request.agent_id,
             conversation_id=request.conversation_id,
             auth=auth,
             visitor_id=request.visitor_id,
+            user_info=user_info_dict,
         )
         logger.info(
             "[QUERY] conversation_ready id=%s history_turns=%d existing=%s",
@@ -348,6 +352,7 @@ async def _get_or_create_conversation(
     conversation_id: str | None,
     auth: AuthContext,
     visitor_id: str | None,
+    user_info: dict | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     supabase = get_supabase()
 
@@ -388,6 +393,16 @@ async def _get_or_create_conversation(
     }
     if visitor_id:
         conv_payload["visitor_id"] = visitor_id
+    
+    # Store user info metadata if provided (requires metadata column in conversations table)
+    if user_info:
+        # For now, log user info. In future, add metadata column to conversations table
+        logger.info(
+            "[QUERY] user_info name=%s email=%s user_id=%s",
+            user_info.get("name") or "N/A",
+            user_info.get("email") or "N/A",
+            user_info.get("user_id") or "N/A",
+        )
 
     result = await supabase.table("conversations").insert(conv_payload).execute()
     new_id = result.data[0]["id"] if result.data else None

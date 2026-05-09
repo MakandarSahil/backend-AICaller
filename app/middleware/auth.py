@@ -125,7 +125,9 @@ async def get_auth_context(
 
     if raw_token.startswith(_API_KEY_PREFIX):
         logger.info("[AUTH] path=%s method=%s type=api_key", request.url.path, request.method)
-        return await _verify_api_key(raw_token)
+        # Get Origin header for domain validation
+        origin = request.headers.get("origin") or request.headers.get("Origin") or request.headers.get("Referer")
+        return await _verify_api_key(raw_token, origin)
     else:
         logger.info("[AUTH] path=%s method=%s type=jwt", request.url.path, request.method)
         return await _verify_jwt(raw_token)
@@ -133,11 +135,11 @@ async def get_auth_context(
 
 # ── API key verification ───────────────────────────────────────────────────────
 
-async def _verify_api_key(raw_key: str) -> AuthContext:
+async def _verify_api_key(raw_key: str, origin: str | None = None) -> AuthContext:
     """
     Verify a CallMind API key (cm_live_xxxx format).
 
-    Flow: sha256(key) → Redis cache → api_keys table → is_active check
+    Flow: sha256(key) → Redis cache → api_keys table → is_active check → domain validation
     The raw key is NEVER stored — only the sha256 hash lives in the DB.
     """
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -149,11 +151,18 @@ async def _verify_api_key(raw_key: str) -> AuthContext:
         if cached:
             data = json.loads(cached)
             logger.debug("API key cache HIT: prefix=%s", raw_key[:12])
+            # Check domain restriction even for cached keys
+            if data.get("allowed_domains"):
+                if not _is_domain_allowed(origin, data["allowed_domains"]):
+                    logger.warning("API key used from unauthorized domain: %s", origin)
+                    raise HTTPException(status_code=403, detail="Domain not authorized for this API key")
             return AuthContext(
                 workspace_id=data["workspace_id"],
                 auth_type="api_key",
                 identity_id=data["id"],
             )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.warning("Redis cache read failed for API key: %s", exc)
 
@@ -161,7 +170,7 @@ async def _verify_api_key(raw_key: str) -> AuthContext:
         supabase = get_supabase()
         result = (
             await supabase.table("api_keys")
-            .select("id, workspace_id, is_active, name")
+            .select("id, workspace_id, is_active, name, allowed_domains")
             .eq("key_hash", key_hash)
             .single()
             .execute()
@@ -177,13 +186,26 @@ async def _verify_api_key(raw_key: str) -> AuthContext:
     if not row.get("is_active", False):
         raise HTTPException(status_code=403, detail="API key has been revoked")
 
+    # Check domain restriction
+    allowed_domains = row.get("allowed_domains")
+    if allowed_domains:
+        if not _is_domain_allowed(origin, allowed_domains):
+            logger.warning(
+                "API key used from unauthorized domain: key=%s domain=%s allowed=%s",
+                row["id"], origin, allowed_domains
+            )
+            raise HTTPException(status_code=403, detail="Domain not authorized for this API key")
+
     asyncio.create_task(_update_key_last_used(row["id"]))
 
     try:
+        cache_data = {"id": row["id"], "workspace_id": row["workspace_id"]}
+        if allowed_domains:
+            cache_data["allowed_domains"] = allowed_domains
         await redis.setex(
             cache_key,
             _AUTH_CACHE_TTL,
-            json.dumps({"id": row["id"], "workspace_id": row["workspace_id"]}),
+            json.dumps(cache_data),
         )
     except Exception:
         pass
@@ -194,6 +216,55 @@ async def _verify_api_key(raw_key: str) -> AuthContext:
         auth_type="api_key",
         identity_id=row["id"],
     )
+
+
+def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
+    """
+    Check if the request origin is in the list of allowed domains.
+    
+    Supports:
+    - Exact match: example.com matches example.com
+    - Wildcard: *.example.com matches sub.example.com, app.example.com
+    - localhost: Always allowed for development
+    """
+    if not origin:
+        # No origin header - allow for now (some clients don't send it)
+        return True
+    
+    # Parse origin to get just the hostname
+    try:
+        if origin.startswith("http://") or origin.startswith("https://"):
+            hostname = origin.split("://")[1].split(":")[0].split("/")[0]
+        else:
+            hostname = origin
+    except Exception:
+        return False
+    
+    # Always allow localhost for development
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+    
+    for allowed in allowed_domains:
+        if not allowed:
+            continue
+            
+        # Exact match
+        if hostname == allowed:
+            return True
+        
+        # Wildcard match: *.example.com
+        if allowed.startswith("*."):
+            suffix = allowed[2:]  # Remove "*."
+            if hostname.endswith(suffix) and hostname != suffix:
+                return True
+        
+        # Handle www subdomain automatically
+        if allowed.startswith("www."):
+            without_www = allowed[4:]
+            if hostname == without_www or hostname == allowed:
+                return True
+    
+    return False
 
 
 async def _update_key_last_used(api_key_id: str) -> None:

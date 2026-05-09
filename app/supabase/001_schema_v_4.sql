@@ -654,3 +654,38 @@ where routine_schema = 'public'
 select count(*) as number_pool_count  from number_pool;   -- should still be 1
 select count(*) as phone_numbers_count from phone_numbers; -- should still be 1
 select number, webhook_url, is_active from phone_numbers;  -- should show your Twilio number
+
+
+-- =============================================================================
+-- API KEYS DOMAIN RESTRICTION (Added for widget domain security)
+-- =============================================================================
+-- Adds allowed_domains column to api_keys table for restricting widget/API usage
+-- to specific domains. NULL or empty array means no restrictions.
+-- Wildcards supported: *.example.com matches any subdomain.
+-- =============================================================================
+
+alter table api_keys
+  add column if not exists allowed_domains text[] default null;
+
+comment on column api_keys.allowed_domains is
+  'Array of allowed domains for this API key (e.g., ["example.com", "www.example.com"]).
+  NULL or empty array means no restrictions (allow all domains).
+  Wildcards supported: *.example.com matches any subdomain.';
+
+-- Set existing rows to NULL (no restriction by default)
+update api_keys
+set allowed_domains = null
+where allowed_domains is null;
+
+
+-- =============================================================================
+-- UPDATED VERIFICATION (includes api_keys check)
+-- =============================================================================
+
+-- Check allowed_domains column exists
+select column_name, data_type
+from information_schema.columns
+where table_schema = 'public'
+  and table_name = 'api_keys'
+  and column_name = 'allowed_domains';
+-- Expected: 1 row (data_type = ARRAY)
