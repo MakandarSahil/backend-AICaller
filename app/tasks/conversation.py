@@ -360,3 +360,158 @@ def _analyze_conversation(conversation_history: list[dict[str, str]]) -> dict:
         "had_tool_call": had_tool_call,
         "tool_calls_made": tool_calls_made,
     }
+
+
+# ── NEW: Text API Analytics Task ─────────────────────────────────────────────
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=10,
+    name="tasks.save_text_conversation",
+)
+def save_text_conversation(
+    self,
+    *,
+    agent_id: str,
+    conversation_id: str,
+    source: str = "api",
+) -> dict:
+    """
+    Celery task: Generate analytics for text_api conversations (widget/API usage).
+    Similar to save_conversation for voice, but for text-based interactions.
+    
+    This runs after the conversation is completed to:
+    1. Generate summary
+    2. Analyze outcome, sentiment, topics
+    3. Create/update analytics row
+    
+    Retries up to 3 times with 10s delay on failure.
+    """
+    logger.info(
+        "save_text_conversation: agent_id=%s conv_id=%s source=%s",
+        agent_id, conversation_id, source
+    )
+
+    try:
+        result = asyncio.run(
+            _save_text_async(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                source=source,
+            )
+        )
+        return result
+    except Exception as exc:
+        logger.error("save_text_conversation failed: %s", exc, exc_info=True)
+        raise self.retry(exc=exc)
+
+
+async def _save_text_async(
+    *,
+    agent_id: str,
+    conversation_id: str,
+    source: str,
+) -> dict:
+    """Async implementation for text conversation analytics."""
+    from supabase._async.client import create_client
+    from groq import AsyncGroq
+
+    # Worker process — initialise its own clients
+    supabase = await create_client(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+    )
+    groq = AsyncGroq(api_key=settings.groq_api_key)
+
+    # Fetch conversation and messages
+    conv_result = await (
+        supabase.table("conversations")
+        .select("id, status, message_count")
+        .eq("id", conversation_id)
+        .single()
+        .execute()
+    )
+
+    if not conv_result.data:
+        logger.error("Conversation not found: %s", conversation_id)
+        return {"status": "error", "reason": "conversation_not_found"}
+
+    # Fetch all messages
+    msg_result = await (
+        supabase.table("messages")
+        .select("role, content")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+    conversation_history = [
+        {"role": row["role"], "content": row["content"]}
+        for row in (msg_result.data or [])
+        if row.get("role") in ("user", "assistant") and row.get("content")
+    ]
+
+    if not conversation_history:
+        logger.warning("No messages found for conv_id=%s", conversation_id)
+        return {"status": "error", "reason": "no_messages"}
+
+    # Generate summary
+    summary = await _generate_summary(groq, conversation_history)
+
+    # Analyze conversation
+    analysis = _analyze_conversation(conversation_history)
+
+    # Update conversation row with summary and outcome
+    try:
+        await (
+            supabase.table("conversations")
+            .update({
+                "summary": summary,
+                "outcome": analysis["outcome"],
+                "had_tool_call": analysis["had_tool_call"],
+            })
+            .eq("id", conversation_id)
+            .execute()
+        )
+        logger.info("Updated conversation row: conv_id=%s", conversation_id)
+    except Exception as exc:
+        logger.warning("Could not update conversation row conv_id=%s: %s", conversation_id, exc)
+
+    # Persist analytics row
+    try:
+        await (
+            supabase.table("conversation_analytics")
+            .upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "overall_intent": analysis["overall_intent"],
+                    "sentiment_start": analysis["sentiment_start"],
+                    "sentiment_end": analysis["sentiment_end"],
+                    "sentiment_arc": analysis["sentiment_arc"],
+                    "topics": analysis["topics"],
+                    "entities_mentioned": analysis["entities_mentioned"],
+                    "outcome": analysis["outcome"],
+                    "resolution_turns": analysis["resolution_turns"],
+                    "key_phrases": analysis["key_phrases"],
+                    "tool_calls_made": analysis["tool_calls_made"],
+                },
+                on_conflict="conversation_id",
+            )
+            .execute()
+        )
+        logger.info("Upserted analytics row: conv_id=%s", conversation_id)
+    except Exception as exc:
+        logger.warning("Could not upsert analytics conv_id=%s: %s", conversation_id, exc)
+
+    logger.info(
+        "save_text_conversation complete: conv_id=%s source=%s messages=%d",
+        conversation_id, source, len(conversation_history)
+    )
+
+    return {
+        "status": "ok",
+        "conversation_id": conversation_id,
+        "message_count": len(conversation_history),
+        "source": source,
+    }
