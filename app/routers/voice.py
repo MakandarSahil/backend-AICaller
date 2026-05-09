@@ -11,6 +11,7 @@ BYO Twilio Support:
 """
 
 import logging
+import os
 from html import escape
 from urllib.parse import urlparse
 
@@ -115,7 +116,8 @@ async def twiml_webhook(
             logger.info("Using BYO Twilio credentials for number=%s", to_number)
     
     # Validate Twilio signature with appropriate credentials
-    if settings.is_production and auth_token:
+    # Always validate when auth_token is available (BYO or platform)
+    if auth_token:
         if not await _validate_twilio_signature(request, auth_token, agent_id, form_data):
             logger.warning(
                 "Twilio signature FAILED: agent_id=%s ip=%s is_byo=%s",
