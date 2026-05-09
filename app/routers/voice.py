@@ -130,8 +130,8 @@ async def twiml_webhook(
         raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
 
     # Use form data already fetched above
-    from_number = str(form.get("From") or "")
-    call_sid = str(form.get("CallSid") or "")
+    from_number = str(form_data.get("From") or "")
+    call_sid = str(form_data.get("CallSid") or "")
     if not from_number:
         logger.warning("TwiML webhook missing From: agent_id=%s call_sid=%s", agent_id, call_sid)
 
@@ -176,17 +176,19 @@ async def _validate_twilio_signature(request: Request, auth_token: str | None = 
         
         signature = request.headers.get("X-Twilio-Signature", "")
         
-        # CRITICAL: For POST requests, Twilio signs the URL WITHOUT query parameters!
-        # The agent_id and other params are sent in the form body.
-        # See: https://www.twilio.com/docs/usage/security#validating-requests
+        # Twilio signs the COMPLETE URL including query string
+        # https://www.twilio.com/docs/usage/security#validating-requests
+        # CRITICAL: agent_id is in the query string, so we MUST include it!
         forwarded_proto = request.headers.get("x-forwarded-proto")
         forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         
+        # Reconstruct URL with agent_id query param
+        query = f"?agent_id={agent_id}" if agent_id else ""
+        
         if forwarded_proto and forwarded_host:
-            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}"
+            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}{query}"
         else:
-            # Use base URL without query string
-            url = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
+            url = f"{request.url.scheme}://{request.url.netloc}{request.url.path}{query}"
 
         # Use provided form data (prevents double-reading the stream)
         if form_data is not None:
@@ -194,21 +196,12 @@ async def _validate_twilio_signature(request: Request, auth_token: str | None = 
         else:
             params = dict(await request.form()) if request.method == "POST" else {}
         
-        logger.info(
-            "Twilio signature validation: url=%s method=%s signature_present=%s params=%s",
-            url,
-            request.method,
-            bool(signature),
-            list(params.keys())
-        )
-        
         is_valid = RequestValidator(token).validate(url, params, signature)
         if not is_valid:
             logger.warning(
-                "Twilio signature mismatch: url=%s method=%s params=%s",
+                "Twilio signature mismatch: url=%s method=%s",
                 url,
-                request.method,
-                params
+                request.method
             )
         return is_valid
     except Exception as exc:
@@ -230,13 +223,11 @@ async def _get_provider_credentials_for_number(phone_number: str) -> dict | None
         supabase = get_supabase()
         
         # Look up the phone number
-        # Note: Using .filter() instead of .eq() for is_active to avoid case issues
         try:
             result = (
                 await supabase.table("phone_numbers")
-                .select("telephony_provider_id, number_type")
+                .select("telephony_provider_id, number_type, is_active")
                 .eq("number", phone_number)
-                .eq("is_active", True)
                 .maybe_single()
                 .execute()
             )
@@ -245,7 +236,12 @@ async def _get_provider_credentials_for_number(phone_number: str) -> dict | None
             return None
         
         if not result or not result.data:
-            logger.debug("Phone number not found or query returned no data: %s", phone_number)
+            logger.debug("Phone number not found in database: %s", phone_number)
+            return None
+        
+        # Check if number is active
+        if not result.data.get("is_active", False):
+            logger.debug("Phone number is not active: %s", phone_number)
             return None
         
         provider_id = result.data.get("telephony_provider_id")
