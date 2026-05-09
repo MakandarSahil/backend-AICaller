@@ -239,7 +239,7 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
             hostname = origin
     except Exception:
         return False
-    hostname = hostname.lower().strip().rstrip(".")
+    hostname = _normalize_domain(hostname)
     
     # Always allow localhost for development
     if hostname in ("localhost", "127.0.0.1", "::1"):
@@ -248,7 +248,7 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
     for allowed in allowed_domains:
         if not allowed:
             continue
-        allowed = allowed.lower().strip().rstrip(".")
+        allowed = _normalize_domain(allowed)
             
         # Exact match
         if hostname == allowed:
@@ -267,6 +267,11 @@ def _is_domain_allowed(origin: str | None, allowed_domains: list[str]) -> bool:
                 return True
     
     return False
+
+
+def _normalize_domain(value: str) -> str:
+    """Normalize domain text for comparisons (lowercase, trim, drop trailing dot)."""
+    return value.lower().strip().rstrip(".")
 
 
 async def _update_key_last_used(api_key_id: str) -> None:

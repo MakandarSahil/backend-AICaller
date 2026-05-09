@@ -1,13 +1,30 @@
 import os
 
+import pytest
 
-os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
-os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test")
-os.environ.setdefault("AZURE_SPEECH_KEY", "test")
-os.environ.setdefault("AZURE_SPEECH_REGION", "eastus")
-os.environ.setdefault("GROQ_API_KEY", "test")
+_REQUIRED_ENV = {
+    "SUPABASE_URL": "https://example.supabase.co",
+    "SUPABASE_SERVICE_ROLE_KEY": "test",
+    "AZURE_SPEECH_KEY": "test",
+    "AZURE_SPEECH_REGION": "eastus",
+    "GROQ_API_KEY": "test",
+}
+_PREEXISTING_ENV = {key: os.environ.get(key) for key in _REQUIRED_ENV}
+
+for key, value in _REQUIRED_ENV.items():
+    os.environ.setdefault(key, value)
 
 from app.middleware.auth import _is_domain_allowed
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_env_after_module():
+    yield
+    for key, previous_value in _PREEXISTING_ENV.items():
+        if previous_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous_value
 
 
 def test_wildcard_requires_subdomain_boundary():
