@@ -209,9 +209,8 @@ jobs:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
           key: ${{ secrets.AZURE_VM_SSH_KEY }}
-          password: ${{ secrets.AZURE_VM_PASSWORD }}
           source: "docker/"
-          target: "/home/spiderman/aicaller/prod/"
+          target: "~/aicaller/prod/"
 
       - name: Deploy
         uses: appleboy/ssh-action@v1.0.3
@@ -219,13 +218,12 @@ jobs:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
           key: ${{ secrets.AZURE_VM_SSH_KEY }}
-          password: ${{ secrets.AZURE_VM_PASSWORD }}
           script: |
             set -e
-            mkdir -p /home/spiderman/aicaller/prod/docker
+            mkdir -p $HOME/aicaller/prod/docker
 
             # Write .env next to the compose file so docker compose picks it up
-            cat > /home/spiderman/aicaller/prod/docker/.env << EOF
+            cat > $HOME/aicaller/prod/docker/.env << EOF
             ENV=production
             IMAGE_TAG=${{ needs.version.outputs.image_tag }}
             DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
@@ -242,15 +240,15 @@ jobs:
             API_DOMAIN=${{ secrets.API_DOMAIN }}
             EOF
 
-            cd /home/spiderman/aicaller/prod
+            cd $HOME/aicaller/prod
 
             echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
-            docker compose -f docker/docker-compose.prod.yml pull api redis
-            docker compose -f docker/docker-compose.prod.yml up -d --remove-orphans traefik api redis
+            docker compose -p aicaller -f docker/docker-compose.prod.yml pull
+            docker compose -p aicaller -f docker/docker-compose.prod.yml up -d --remove-orphans
 
             echo "Waiting for health check..."
             sleep 15
-            curl -f http://localhost/health || (docker compose -f docker/docker-compose.prod.yml logs --tail=50 api && exit 1)
+            curl -f http://localhost/health || (docker compose -p aicaller -f docker/docker-compose.prod.yml logs --tail=50 api && exit 1)
 
             docker image prune -f
 
