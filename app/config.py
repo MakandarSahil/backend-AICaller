@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # groq
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"
-    groq_max_tokens: int = 1024
+    groq_max_tokens: int = 512
     groq_temperature: float = 0.7
 
     # STT
@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     # barge-in
     # Threshold is on PCM16 amplitude scale (0-32767).
     # TTS echo through phone lines typically measures 1000-3000.
-    # Set above this range so only real user speech (>5000) triggers barge-in.
-    barge_in_threshold: int = 5000
-    barge_in_min_chunks: int = 5
+    # Lower threshold for more responsive interruption detection.
+    barge_in_threshold: int = 3500
+    barge_in_min_chunks: int = 3
 
     # Caching (Redis TTLs in seconds)
     cache_ttl_agent: int = 3600           # 1 hour — agent config rarely changes

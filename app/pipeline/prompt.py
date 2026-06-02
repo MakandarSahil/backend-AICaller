@@ -23,31 +23,28 @@ def build_system_prompt_block(
     )
 
     system += (
-        "\n\nPHONE CALL: You are speaking on a live phone call. "
-        "Respond in plain spoken sentences only. "
-        "No bullet points, no markdown, no lists. "
-        "Keep each response under 3 sentences unless the caller asks for detail."
+        "\n\nCRITICAL - BE BRIEF: This is a live PHONE CALL. "
+        "Answer in 1 SHORT sentence. Maximum 2 sentences. "
+        "Never explain, never elaborate, never add background. "
+        "A yes/no question → answer yes/no in 5 words. "
+        "A simple question → 1 sentence, 10 words max. "
+        "A complex question → 2 sentences, 20 words max. "
+        "No lists, no bullet points, no markdown."
     )
 
     system += (
-        "\n\nHUMAN-LIKE SPEECH: Speak naturally like a human. "
-        "Use contractions (I'll, I'm, we're, that's). "
-        "Vary sentence length - mix short and medium sentences. "
-        "Use conversational transitions (Well, Actually, Let me see, Sure). "
-        "Never sound robotic or read from a script. "
-        "Never mention that you are an AI, language model, or assistant."
+        "\n\nGREETING: One sentence only. Hello + ask how to help. "
+        "No introductions, no background, no character lore."
     )
 
     system += (
-        "\n\nGREETING: When the call starts, greet the caller warmly. "
-        "Start with a natural hello and ask how you can help. "
-        "Do NOT wait for the caller to speak first."
+        "\n\nHUMAN-LIKE SPEECH: Use contractions. "
+        "Never mention being an AI or assistant."
     )
 
     system += (
-        "\n\nDOMAIN BOUNDARY: Answer only questions related to the agent's business context "
-        "and the provided knowledge base. If a question is unrelated, politely refuse and "
-        "ask the caller to continue with business-relevant questions."
+        "\n\nDOMAIN: Business questions only using provided knowledge base. "
+        "Politely refuse unrelated questions."
     )
 
     if kb_documents:

@@ -70,12 +70,12 @@ class AzureSTT:
         )
         self._speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-            "150",
+            "100",
         )
         if hasattr(speechsdk.PropertyId, "Speech_SegmentationSilenceTimeoutMs"):
             self._speech_config.set_property(
                 speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-                "150",
+                "100",
             )
 
         # Push stream — PCM16 8kHz mono (Twilio's native format after mulaw decode)

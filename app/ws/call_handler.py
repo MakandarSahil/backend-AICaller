@@ -28,7 +28,8 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 _VOICE_ACTIVITY_THRESHOLD = 500.0
-_PARTIAL_COMMIT_SILENCE_CHUNKS = 25  # ~500ms at 20ms Twilio media frames — gives Azure time for on_final
+_PARTIAL_COMMIT_SILENCE_CHUNKS = 10  # ~200ms — commits on sustained silence
+_PARTIAL_COMMIT_MAX_PACKETS = 200   # ~4 seconds — force commit if partial stuck (noise)
 _POST_CLEAR_STT_SUPPRESS_MS = 200
 
 
@@ -218,6 +219,7 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
         if session.latest_media_timestamp < session.stt_resume_after_ts:
             session.stt_partial_text = ""
             session.stt_silence_chunks = 0
+            session.stt_partial_pending_since_packet = 0
             return
 
         volume = calculate_volume(mulaw_bytes)
@@ -230,22 +232,41 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
         if session.stt_recognizer:
             session.stt_recognizer.push(pcm16)
 
-        # Azure can delay final transcripts until stream stop in some PSTN paths.
-        # Fallback: if we have a partial and then sustained silence, commit it now.
-        if (
-            session.stt_partial_text
-            and session.stt_silence_chunks >= _PARTIAL_COMMIT_SILENCE_CHUNKS
-            and not session.stopped
-        ):
-            partial_text = session.stt_partial_text
-            session.stt_partial_text = ""
-            session.stt_silence_chunks = 0
-            logger.info(
-                "STT partial committed on silence [%s]: %s",
-                session.call_sid,
-                partial_text,
+        # Track when partial first appeared (for time-based force commit)
+        if session.stt_partial_text and session.stt_partial_pending_since_packet == 0:
+            session.stt_partial_pending_since_packet = session.media_packet_count
+
+        # Azure can delay final transcripts indefinitely in some PSTN paths.
+        # Two fallbacks to detect end-of-utterance:
+        #
+        # 1. Silence-based: user stopped speaking → sustained quiet audio
+        # 2. Time-based:  partial stuck too long → force commit (noisy environment)
+        if session.stt_partial_text and not session.stopped:
+
+            packets_since_partial = (
+                session.media_packet_count - session.stt_partial_pending_since_packet
+                if session.stt_partial_pending_since_packet > 0
+                else 0
             )
-            asyncio.create_task(_handle_final_transcript(websocket, session, partial_text))
+
+            should_commit = (
+                session.stt_silence_chunks >= _PARTIAL_COMMIT_SILENCE_CHUNKS
+                or packets_since_partial >= _PARTIAL_COMMIT_MAX_PACKETS
+            )
+
+            if should_commit:
+                partial_text = session.stt_partial_text
+                reason = "silence" if session.stt_silence_chunks >= _PARTIAL_COMMIT_SILENCE_CHUNKS else "timeout"
+                session.stt_partial_text = ""
+                session.stt_silence_chunks = 0
+                session.stt_partial_pending_since_packet = 0
+                logger.info(
+                    "STT partial committed (%s) [%s]: %s",
+                    reason,
+                    session.call_sid,
+                    partial_text,
+                )
+                asyncio.create_task(_handle_final_transcript(websocket, session, partial_text))
     else:
         session.speaking_chunks += 1
 
@@ -329,6 +350,7 @@ async def _handle_stop(call_sid: str) -> None:
     if session.stt_partial_text:
         partial_text = session.stt_partial_text.strip()
         session.stt_partial_text = ""
+        session.stt_partial_pending_since_packet = 0
         if partial_text:
             _append_transcript_if_new(session, partial_text)
 
@@ -368,9 +390,9 @@ async def _handle_stop(call_sid: str) -> None:
 
 # ── Sentence boundary helpers ─────────────────────────────────────────────────
 
-_SENTENCE_ENDINGS = {".", "!", "?"}
+_SENTENCE_ENDINGS = {".", "!", "?", ",", ":", ";"}
 _MIN_SENTENCE_LEN = 2
-_MAX_BUFFER_CHARS = 45
+_MAX_BUFFER_CHARS = 50
 
 
 def _find_sentence_boundary(text: str) -> int:
@@ -484,11 +506,15 @@ async def _trigger_greeting(websocket: WebSocket, session: SessionState) -> None
             _guard_speaking_chunks = session.speaking_chunks
 
             async def _greeting_mark_timeout() -> None:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(2.0)
                 if not session.is_speaking or session.stopped:
                     return
                 if session.speaking_chunks < _guard_speaking_chunks:
                     return
+                if session.stt_recognizer and session.stt_audio_buffer:
+                    for chunk in session.stt_audio_buffer:
+                        session.stt_recognizer.push(chunk)
+                    session.stt_audio_buffer.clear()
                 session.is_speaking = False
 
             asyncio.create_task(_greeting_mark_timeout())
@@ -575,6 +601,7 @@ async def _handle_final_transcript(
     session.is_speaking = True
     session.stt_partial_text = ""
     session.stt_silence_chunks = 0
+    session.stt_partial_pending_since_packet = 0
     session.stt_audio_buffer.clear()
     session.barge_in_loud_samples = 0
     session.speaking_chunks = 0
@@ -667,7 +694,7 @@ async def _handle_final_transcript(
             _guard_speaking_chunks = session.speaking_chunks
 
             async def _mark_timeout() -> None:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(2.0)
                 if not session.is_speaking or session.stopped:
                     return
                 if session.speaking_chunks < _guard_speaking_chunks:
@@ -676,6 +703,11 @@ async def _handle_final_transcript(
                     "Mark timeout — force is_speaking=False [%s]",
                     session.call_sid,
                 )
+                # Flush any buffered audio to STT before re-enabling input
+                if session.stt_recognizer and session.stt_audio_buffer:
+                    for chunk in session.stt_audio_buffer:
+                        session.stt_recognizer.push(chunk)
+                    session.stt_audio_buffer.clear()
                 session.is_speaking = False
 
             asyncio.create_task(_mark_timeout())
@@ -801,6 +833,7 @@ async def _cancel_tts(websocket: WebSocket, session: SessionState) -> None:
 
     session.stt_partial_text = ""
     session.stt_silence_chunks = 0
+    session.stt_partial_pending_since_packet = 0
     session.stt_resume_after_ts = session.latest_media_timestamp + _POST_CLEAR_STT_SUPPRESS_MS
     session.is_speaking = False
     session.tts_active = False

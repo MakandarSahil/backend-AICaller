@@ -147,6 +147,6 @@ def _build_ssml(text: str, voice: str) -> str:
     )
     return (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}"><prosody rate="+15%">{safe_text}</prosody></voice>'
+        f'<voice name="{voice}"><prosody rate="+10%">{safe_text}</prosody></voice>'
         f"</speak>"
     )

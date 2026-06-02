@@ -109,6 +109,11 @@ class SessionState:
     stt_silence_chunks: int = 0
     # Consecutive low-volume chunks while not speaking.
 
+    stt_partial_pending_since_packet: int = 0
+    # media_packet_count when stt_partial_text first became non-empty.
+    # Used for time-based force commit: if partial stays pending for
+    # too long (noise prevents silence detection), we force-submit it.
+
     stt_resume_after_ts: int = 0
     # Ignore live inbound audio until this Twilio media timestamp after a
     # Twilio clear. This drops the tail of the agent's own audio echo while
