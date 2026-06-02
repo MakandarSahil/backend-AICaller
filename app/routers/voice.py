@@ -180,17 +180,28 @@ async def _validate_twilio_signature(request: Request, auth_token: str | None = 
         
         # Twilio signs the COMPLETE URL including query string
         # https://www.twilio.com/docs/usage/security#validating-requests
-        # CRITICAL: agent_id is in the query string, so we MUST include it!
         forwarded_proto = request.headers.get("x-forwarded-proto")
         forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         
-        # Reconstruct URL with agent_id query param
-        query = f"?agent_id={agent_id}" if agent_id else ""
+        if forwarded_proto:
+            forwarded_proto = forwarded_proto.split(",")[0].strip()
+        if forwarded_host:
+            forwarded_host = forwarded_host.split(",")[0].strip()
+            # Remove default port 443 if present for https, as Twilio might not include it
+            if forwarded_proto == "https" and forwarded_host.endswith(":443"):
+                forwarded_host = forwarded_host[:-4]
+            # Remove default port 80 if present for http
+            elif forwarded_proto == "http" and forwarded_host.endswith(":80"):
+                forwarded_host = forwarded_host[:-3]
+        
+        # Reconstruct URL with full query string to preserve all parameters
+        query = f"?{request.url.query}" if request.url.query else ""
         
         if forwarded_proto and forwarded_host:
             url = f"{forwarded_proto}://{forwarded_host}{request.url.path}{query}"
         else:
-            url = f"{request.url.scheme}://{request.url.netloc}{request.url.path}{query}"
+            # Fallback to the parsed URL components
+            url = f"{request.url.scheme}://{request.url.netloc.split(':')[0] if request.url.scheme in ('http', 'https') and request.url.netloc.endswith(('80', '443')) else request.url.netloc}{request.url.path}{query}"
 
         # Use provided form data (prevents double-reading the stream)
         if form_data is not None:
@@ -228,7 +239,7 @@ async def _get_provider_credentials_for_number(phone_number: str) -> dict | None
         try:
             result = (
                 await supabase.table("phone_numbers")
-                .select("telephony_provider_id, number_type, is_active")
+                .select("telephony_provider_id, number_type, is_active, workspace_id")
                 .eq("number", phone_number)
                 .maybe_single()
                 .execute()
@@ -247,20 +258,35 @@ async def _get_provider_credentials_for_number(phone_number: str) -> dict | None
             return None
         
         provider_id = result.data.get("telephony_provider_id")
-        if not provider_id:
+        workspace_id = result.data.get("workspace_id")
+        number_type = result.data.get("number_type")
+        
+        # Get provider record
+        if provider_id:
+            provider_result = (
+                await supabase.table("workspace_telephony_providers")
+                .select("vault_secret_id, provider")
+                .eq("id", provider_id)
+                .eq("is_active", True)
+                .single()
+                .execute()
+            )
+        elif number_type == "own" and workspace_id:
+            # Fallback for BYO numbers without a specific provider_id mapped
+            provider_result = (
+                await supabase.table("workspace_telephony_providers")
+                .select("vault_secret_id, provider")
+                .eq("workspace_id", workspace_id)
+                .eq("provider", "twilio")
+                .eq("is_active", True)
+                .limit(1)
+                .maybe_single()
+                .execute()
+            )
+        else:
             # No provider = platform number
             logger.debug("Using platform credentials for number: %s", phone_number)
             return None
-        
-        # Get provider record
-        provider_result = (
-            await supabase.table("workspace_telephony_providers")
-            .select("vault_secret_id, provider")
-            .eq("id", provider_id)
-            .eq("is_active", True)
-            .single()
-            .execute()
-        )
         
         if not provider_result.data:
             logger.warning("Provider not found or inactive: %s", provider_id)
