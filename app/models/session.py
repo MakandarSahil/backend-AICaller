@@ -42,6 +42,19 @@ class SessionState:
     # Raw text of every KB document attached to this agent.
     # Injected into system prompt (full-context dump, v1).
 
+    caller_history: list[dict] = field(default_factory=list)
+    # Past conversation summaries for this caller.
+    # Preloaded in background task after caller_id is resolved.
+
+    cached_system_prompt: str | None = None
+    # Pre-built system prompt (system + KB + caller history) cached to avoid
+    # rebuilding every LLM turn. Only conversation turns change per turn.
+
+    groq_messages: list[dict[str, str]] | None = None
+    # Running Groq messages list reused across turns.
+    # Built once on first turn, then only the new user/assistant messages are
+    # appended each turn — eliminates full prompt rebuild latency.
+
     # ── In-call conversation history ───────────────────────────────────────
     conversation_history: list[dict[str, str]] = field(default_factory=list)
     # [{role: "user"|"assistant", content: "..."}]
@@ -56,6 +69,12 @@ class SessionState:
     is_speaking: bool = False
     # True while TTS audio is actively being streamed to Twilio.
     # Incoming audio is NOT pushed to STT while this is True.
+
+    tts_active: bool = False
+    # True while the TTS worker task is alive (between the start of the first
+    # sentence and the end of the last). Prevents _handle_mark from setting
+    # is_speaking=False between individual sentences — only the final worker
+    # completion should allow the is_speaking flip via marks.
 
     current_tts_cancel: Callable[[], None] | None = None
     # Cancel function for the current in-flight TTS sentence stream.
@@ -90,10 +109,35 @@ class SessionState:
     stt_silence_chunks: int = 0
     # Consecutive low-volume chunks while not speaking.
 
+    stt_resume_after_ts: int = 0
+    # Ignore live inbound audio until this Twilio media timestamp after a
+    # Twilio clear. This drops the tail of the agent's own audio echo while
+    # still allowing buffered barge-in audio to be flushed into STT.
+
+    pending_user_transcript_norm: str = ""
+    # Normalized user transcript currently being handled.
+    # Prevents duplicate silence-commit / Azure-final races from creating
+    # multiple turns for the same utterance.
+
+    stt_audio_buffer: list[bytes] = field(default_factory=list)
+    # Ring buffer of recent PCM16 chunks kept while agent speaks.
+    # On barge-in these are flushed to Azure STT so the first ~200ms
+    # of the user's interruption is not lost.
+
+    speaking_chunks: int = 0
+    # Chunks elapsed since agent started speaking. Barge-in is disabled
+    # for the first N chunks to prevent the initial echo burst from
+    # falsely cancelling TTS. Reset to 0 when is_speaking becomes True.
+
     # ── Sentence counter ───────────────────────────────────────────────────
     sentence_count: int = 0
     # Monotonically incremented per TTS sentence.
     # Generates unique Twilio mark names: "sentence_0", "sentence_1", …
+
+    response_generation: int = 0
+    # Monotonically increasing response turn id.
+    # Incremented on each new response start and on barge-in cancellation so
+    # stale LLM/TTS tasks cannot mutate the active turn's state.
 
     # ── Lifecycle guard ────────────────────────────────────────────────────
     shutdown_in_progress: bool = False

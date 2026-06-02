@@ -7,33 +7,93 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-def build_prompt(payload: QueryPayload) -> list[dict[str, str]]:
+def build_system_prompt_block(
+    agent_config: dict,
+    kb_documents: list[str],
+    caller_history: list[dict],
+) -> str:
     """
-    Assemble the full Groq message list for one LLM turn.
-
-    Structure (v1 - full context dump, no RAG):
-        1. System prompt       from agent config
-        2. Knowledge base      all attached KB docs, concatenated, hard-capped
-        3. Caller history      past conversation summaries for this caller
-        4. Current turns       this call/session conversation so far
-        5. Current user turn   the message we're responding to right now
-
-    Returns: list[dict] ready to pass to groq.chat.completions.create(messages=...)
+    Build the static system prompt block without conversation turns.
+    This is cached at session start and reused across LLM turns to avoid
+    rebuilding the full KB concatenation every time.
     """
-    messages: list[dict[str, str]] = []
-
-    # 1) System prompt
-    system = payload.agent_config.get(
+    system = agent_config.get(
         "system_prompt",
         "You are a helpful, concise voice assistant. Keep responses short and natural.",
     )
 
-    if payload.channel == Channel.TWILIO:
-        system += (
-            "\n\nIMPORTANT: You are speaking on a phone call. "
-            "Respond in plain spoken sentences only. "
-            "No bullet points, no markdown, no lists. "
-            "Keep each response under 3 sentences unless the caller asks for detail."
+    system += (
+        "\n\nIMPORTANT: You are speaking on a phone call. "
+        "Respond in plain spoken sentences only. "
+        "No bullet points, no markdown, no lists. "
+        "Keep each response under 3 sentences unless the caller asks for detail."
+    )
+
+    system += (
+        "\n\nDOMAIN BOUNDARY: Answer only questions related to the agent's business context "
+        "and the provided knowledge base. If a question is unrelated, politely refuse and "
+        "ask the caller to continue with business-relevant questions."
+    )
+
+    if kb_documents:
+        kb_text = "\n\n---\n\n".join(doc.strip() for doc in kb_documents if doc.strip())
+        if len(kb_text) > settings.kb_max_chars:
+            kb_text = kb_text[: settings.kb_max_chars]
+            kb_text += "\n\n[Knowledge base truncated to fit context window]"
+        system += f"\n\n## KNOWLEDGE BASE\n{kb_text}"
+
+    if caller_history:
+        history_block = _format_caller_history(caller_history)
+        system += f"\n\n## CALLER HISTORY\n{history_block}"
+
+    return system
+
+
+def build_prompt(payload: QueryPayload) -> list[dict[str, str]]:
+    """
+    Assemble the full Groq message list for one LLM turn.
+
+    Two code paths:
+
+    1. Fast path (payload.groq_messages is set):
+       The caller (call_handler.py) maintains a running message list across turns.
+       We just append the current user message — no system prompt rebuild, no
+       conversation history iteration. Zero-alloc for subsequent turns.
+
+    2. Slow path (first turn or no session):
+       Build from scratch using cached_system_prompt + conversation_history.
+
+    Structure:
+        1. System prompt       (cached — rebuilt only at session start or when caller history loads)
+        2. Current turns       this call/session conversation so far
+        3. Current user turn   the message we're responding to right now
+
+    Returns: list[dict] ready to pass to groq.chat.completions.create(messages=...)
+    """
+
+    # ── Fast path: existing messages from session ──────────────────────────
+    if payload.groq_messages is not None:
+        user_text = payload.text.strip()
+        payload.groq_messages.append({"role": "user", "content": user_text})
+        logger.debug(
+            "[PROMPT] fast_path agent=%s appended_user chars=%d total_messages=%d",
+            payload.agent_id,
+            len(user_text),
+            len(payload.groq_messages),
+        )
+        return payload.groq_messages
+
+    # ── Slow path: build from scratch (first turn only) ────────────────────
+    messages: list[dict[str, str]] = []
+
+    # 1) System prompt — use cached if available
+    if payload.cached_system_prompt:
+        system = payload.cached_system_prompt
+    else:
+        system = build_system_prompt_block(
+            agent_config=payload.agent_config,
+            kb_documents=payload.kb_documents,
+            caller_history=payload.caller_history,
         )
 
     preferred_language = _resolve_preferred_language(payload)
@@ -46,33 +106,9 @@ def build_prompt(payload: QueryPayload) -> list[dict[str, str]]:
             "Keep wording natural and concise for spoken conversation."
         )
 
-    system += (
-        "\n\nDOMAIN BOUNDARY: Answer only questions related to the agent's business context "
-        "and the provided knowledge base. If a question is unrelated, politely refuse and "
-        "ask the caller to continue with business-relevant questions."
-    )
-
-    kb_docs_count = len(payload.kb_documents)
-    kb_chars = 0
-
-    # 2) Knowledge base
-    if payload.kb_documents:
-        kb_text = "\n\n---\n\n".join(doc.strip() for doc in payload.kb_documents if doc.strip())
-        kb_chars = len(kb_text)
-        if len(kb_text) > settings.kb_max_chars:
-            kb_text = kb_text[: settings.kb_max_chars]
-            kb_text += "\n\n[Knowledge base truncated to fit context window]"
-
-        system += f"\n\n## KNOWLEDGE BASE\n{kb_text}"
-
-    # 3) Caller history
-    if payload.caller_history:
-        history_block = _format_caller_history(payload.caller_history)
-        system += f"\n\n## CALLER HISTORY\n{history_block}"
-
     messages.append({"role": "system", "content": system})
 
-    # 4) Current conversation turns
+    # 2) Current conversation turns
     valid_turns = 0
     for turn in payload.conversation_history:
         role = turn.get("role", "")
@@ -81,17 +117,18 @@ def build_prompt(payload: QueryPayload) -> list[dict[str, str]]:
             messages.append({"role": role, "content": content})
             valid_turns += 1
 
-    # 5) Current user message
+    # 3) Current user message
     user_text = payload.text.strip()
     messages.append({"role": "user", "content": user_text})
 
+    # Save for next turn — caller can read payload.groq_messages to persist
+    payload.groq_messages = messages
+
     logger.info(
-        "[PROMPT] built agent=%s messages=%d valid_turns=%d kb_docs=%d kb_chars=%d user_chars=%d",
+        "[PROMPT] built agent=%s messages=%d valid_turns=%d user_chars=%d",
         payload.agent_id,
         len(messages),
         valid_turns,
-        kb_docs_count,
-        kb_chars,
         len(user_text),
     )
 

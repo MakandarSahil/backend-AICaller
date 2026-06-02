@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 
 _groq_client: AsyncGroq | None = None
 
-_SENTENCE_ENDINGS = {".", "!", "?", ":", ";"}
-_MIN_SENTENCE_LEN = 4
+_SENTENCE_ENDINGS = {".", "!", "?", ":", ";", ","}
+_MIN_SENTENCE_LEN = 2
+_MAX_BUFFER_CHARS = 45
 
 
 def get_groq_client() -> AsyncGroq:
@@ -122,6 +123,13 @@ async def _stream_groq(payload: QueryPayload) -> AsyncGenerator[str, None]:
                     logger.debug("[LLM] sentence chars=%d text=%r", len(sentence), sentence[:120])
                     yield sentence
 
+            if len(buffer) >= _MAX_BUFFER_CHARS:
+                flush = buffer.strip()
+                buffer = ""
+                if len(flush) >= _MIN_SENTENCE_LEN:
+                    logger.debug("[LLM] force_flush chars=%d text=%r", len(flush), flush[:120])
+                    yield flush
+
         if not is_text_stream:
             final = buffer.strip()
             if len(final) >= _MIN_SENTENCE_LEN:
@@ -141,10 +149,11 @@ async def _stream_groq(payload: QueryPayload) -> AsyncGenerator[str, None]:
 
 def _sentence_boundary(text: str) -> int:
     """
-    Return index of first sentence-ending character that has content after it.
-    Returns -1 if no complete sentence boundary found yet.
+    Return index of first sentence-ending character (. ! ? : ; ,).
+    No guard for trailing content — yields even on the last char
+    so TTS starts as soon as the LLM emits terminal punctuation.
     """
     for i, ch in enumerate(text):
-        if ch in _SENTENCE_ENDINGS and i < len(text) - 1:
+        if ch in _SENTENCE_ENDINGS:
             return i
     return -1

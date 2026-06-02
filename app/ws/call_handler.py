@@ -17,6 +17,7 @@ from app.pipeline.session import (
     get_session,
     load_caller_history,
     populate_session,
+    preload_caller_data,
 )
 from app.pipeline.stt import AzureSTT
 from app.pipeline.tts import synthesize_sentence
@@ -26,8 +27,9 @@ from app.utils.audio import calculate_volume, mulaw_to_pcm16
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-_VOICE_ACTIVITY_THRESHOLD = 8.0
-_PARTIAL_COMMIT_SILENCE_CHUNKS = 25  # ~500ms at 20ms Twilio media frames
+_VOICE_ACTIVITY_THRESHOLD = 500.0
+_PARTIAL_COMMIT_SILENCE_CHUNKS = 8  # ~160ms at 20ms Twilio media frames
+_POST_CLEAR_STT_SUPPRESS_MS = 400
 
 
 async def handle_call(websocket: WebSocket, agent_id: str | None) -> None:
@@ -125,10 +127,23 @@ async def _handle_start(websocket: WebSocket, msg: dict, agent_id: str) -> str:
         await websocket.close()
         return call_sid
 
-    # BUG FIX + GAP FIX: Insert active conversation row NOW so the dashboard
-    # can display "call in progress". Previously this was only done at call end
-    # (INSERT completed) which meant the dashboard had no visibility during a call.
-    session.conversation_id = await _create_active_conversation(session)
+    # Run database writes in the background to prevent blocking media reception
+    async def _background_db_setup():
+        # 1. Resolve caller
+        workspace_id = session.agent_config.get("workspace_id", "")
+        if workspace_id and caller_phone:
+            from app.pipeline.session import resolve_or_create_caller
+            session.caller_id = await resolve_or_create_caller(workspace_id, caller_phone)
+
+        # 2. Preload caller history into session (avoids Supabase query on critical LLM path)
+        if session.caller_id:
+            await preload_caller_data(session)
+
+        # 3. Insert active conversation row NOW so the dashboard
+        # can display "call in progress".
+        session.conversation_id = await _create_active_conversation(session)
+
+    asyncio.create_task(_background_db_setup())
 
     # Wire up STT callbacks — each call gets its own AzureSTT instance
     loop = asyncio.get_running_loop()
@@ -170,7 +185,7 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
 
     Two modes:
     - is_speaking=False: decode + push to Azure STT
-    - is_speaking=True:  check barge-in threshold, cancel if triggered
+    - is_speaking=True:  buffer audio for barge-in recovery, detect interruptions
     """
     media = msg.get("media", {})
     payload_b64 = media.get("payload", "")
@@ -191,7 +206,15 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
             session.is_speaking,
         )
 
+    # Always convert — needed for both STT push and barge-in buffer
+    pcm16 = mulaw_to_pcm16(mulaw_bytes)
+
     if not session.is_speaking:
+        if session.latest_media_timestamp < session.stt_resume_after_ts:
+            session.stt_partial_text = ""
+            session.stt_silence_chunks = 0
+            return
+
         volume = calculate_volume(mulaw_bytes)
 
         if volume > _VOICE_ACTIVITY_THRESHOLD:
@@ -199,7 +222,6 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
         else:
             session.stt_silence_chunks += 1
 
-        pcm16 = mulaw_to_pcm16(mulaw_bytes)
         if session.stt_recognizer:
             session.stt_recognizer.push(pcm16)
 
@@ -220,14 +242,35 @@ async def _handle_media(websocket: WebSocket, msg: dict, session: SessionState) 
             )
             asyncio.create_task(_handle_final_transcript(websocket, session, partial_text))
     else:
+        session.speaking_chunks += 1
+
+        # Ring buffer of recent audio while agent speaks.
+        # When barge-in fires, this buffer is flushed to STT so no words are lost.
+        session.stt_audio_buffer.append(pcm16)
+        if len(session.stt_audio_buffer) > 10:
+            session.stt_audio_buffer.pop(0)
+
         volume = calculate_volume(mulaw_bytes)
         if volume > settings.barge_in_threshold:
             session.barge_in_loud_samples += 1
         else:
             session.barge_in_loud_samples = 0
 
-        if session.barge_in_loud_samples >= settings.barge_in_min_chunks:
-            logger.info("Barge-in: call_sid=%s volume=%.1f", session.call_sid, volume)
+        # Startup guard: skip barge-in for first 25 chunks (500ms).
+        # Phone-line echo cancellers need ~300-500ms to stabilise.
+        # Without this guard the initial TTS echo burst falsely
+        # triggers barge-in, cutting off the first sentence and
+        # creating an interrupt loop.
+        if (
+            session.speaking_chunks >= 25
+            and session.barge_in_loud_samples >= settings.barge_in_min_chunks
+        ):
+            logger.info(
+                "Barge-in: call_sid=%s speaking_chunks=%d volume=%.1f",
+                session.call_sid,
+                session.speaking_chunks,
+                volume,
+            )
             await _cancel_tts(websocket, session)
 
 
@@ -240,8 +283,13 @@ def _handle_mark(msg: dict, session: SessionState) -> None:
     session.latest_mark_confirmed = mark_name
     logger.debug("Mark confirmed: %s (sent=%s)", mark_name, session.latest_mark_sent)
 
+    # Only flip is_speaking=False when the ENTIRE TTS batch is done.
+    # tts_active=True means the TTS worker is still alive and more
+    # sentences may follow — don't flip between sentences or the
+    # worker will skip the remaining sentences.
     if (
         session.is_speaking
+        and not session.tts_active
         and mark_name == session.latest_mark_sent
         and session.current_tts_cancel is None
     ):
@@ -279,7 +327,7 @@ async def _handle_stop(call_sid: str) -> None:
         if partial_text:
             _append_transcript_if_new(session, partial_text)
 
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.05)
 
     # Cancel any in-flight TTS
     if session.current_tts_cancel:
@@ -332,29 +380,54 @@ async def _handle_final_transcript(
     if not text:
         return
 
+    normalized_text = " ".join(text.lower().split())
+    if not normalized_text:
+        return
+
+    # Guard: if already speaking (very fast back-to-back utterances), ignore.
+    # Must come BEFORE _append_transcript_if_new to prevent spurious duplicate
+    # turns from being added to conversation_history while is_speaking is True
+    # (e.g. Azure STT on_final arriving for the same utterance that was already
+    # committed via the silence fallback).
+    if session.is_speaking:
+        logger.debug("Ignoring transcript while speaking [%s]: %s", session.call_sid, text)
+        return
+
+    if session.pending_user_transcript_norm == normalized_text:
+        logger.debug("Duplicate transcript already pending [%s]: %s", session.call_sid, text)
+        return
+
     if not _append_transcript_if_new(session, text):
         return
 
+    session.pending_user_transcript_norm = normalized_text
+
+    # If shutdown is in progress, record the transcript (for persistence) but
+    # skip response generation.
     if session.shutdown_in_progress:
         logger.debug(
             "Transcript recorded during shutdown — skipping response generation [%s]",
             session.call_sid,
         )
-        return
-
-    # Guard: if already speaking (very fast back-to-back utterances), ignore
-    if session.is_speaking:
-        logger.debug("Ignoring transcript while speaking [%s]: %s", session.call_sid, text)
+        if session.pending_user_transcript_norm == normalized_text:
+            session.pending_user_transcript_norm = ""
         return
 
     logger.info("Transcript [%s]: %s", session.call_sid, text)
 
+    session.response_generation += 1
+    response_generation = session.response_generation
     session.is_speaking = True
+    session.stt_partial_text = ""
+    session.stt_silence_chunks = 0
+    session.stt_audio_buffer.clear()
     session.barge_in_loud_samples = 0
+    session.speaking_chunks = 0
 
-    # Load caller history (Redis-cached, fast)
-    caller_history: list[dict] = []
-    if session.caller_id:
+    # Use preloaded caller history if available (loaded in background task),
+    # otherwise fall back to inline load.
+    caller_history = session.caller_history or []
+    if not caller_history and session.caller_id:
         caller_history = await load_caller_history(session.caller_id)
 
     payload = QueryPayload(
@@ -363,36 +436,109 @@ async def _handle_final_transcript(
         channel=Channel.TWILIO,
         agent_config=session.agent_config,
         kb_documents=session.kb_documents,
-        # Pass history EXCLUDING the current user turn we just added
-        # (it's already in payload.text — adding it again would duplicate it)
         conversation_history=session.conversation_history[:-1],
         caller_history=caller_history,
+        cached_system_prompt=session.cached_system_prompt,
+        groq_messages=session.groq_messages,
         call_sid=session.call_sid,
         conversation_id=session.conversation_id,
         caller_id=session.caller_id,
     )
 
-    full_response = ""
-    cancelled = False
+    spoken_response_parts: list[str] = []
+
+    # TTS queue: LLM streams sentences into the queue, the TTS worker
+    # consumes them in order and streams audio to Twilio in parallel.
+    # This decouples LLM generation from TTS playback — the LLM is no
+    # longer blocked while TTS synthesises and plays the current sentence.
+    tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _tts_worker() -> None:
+        """Consume sentences from the queue and stream to Twilio in order."""
+        while True:
+            sentence = await tts_queue.get()
+            if sentence is None:
+                break
+            if not session.is_speaking or session.response_generation != response_generation:
+                break
+            was_cancelled = await _stream_sentence_to_twilio(
+                websocket, session, sentence
+            )
+            if was_cancelled or not session.is_speaking or session.response_generation != response_generation:
+                break
+            spoken_response_parts.append(sentence)
+
+    session.tts_active = True
+    worker = asyncio.create_task(_tts_worker())
 
     try:
         async for sentence in stream_llm_sentences(payload):
-            if cancelled or not session.is_speaking:
+            if not session.is_speaking or session.response_generation != response_generation:
                 logger.info("LLM stream aborted (barge-in) [%s]", session.call_sid)
                 break
 
-            full_response += sentence + " "
-            cancelled = await _stream_sentence_to_twilio(websocket, session, sentence)
-            if cancelled:
-                break
+            await tts_queue.put(sentence)
 
     except Exception as exc:
         logger.error("Pipeline error [%s]: %s", session.call_sid, exc, exc_info=True)
     finally:
-        session.is_speaking = False
-        session.current_tts_cancel = None
-        if full_response.strip():
-            session.add_assistant_turn(full_response.strip())
+        # Signal the TTS worker to stop (None sentinel).
+        # If the worker already stopped (barge-in), this is a no-op.
+        await tts_queue.put(None)
+        await worker  # Wait for worker to finish its current TTS
+
+        if session.response_generation == response_generation:
+            session.tts_active = False
+            session.current_tts_cancel = None
+
+        # Never set is_speaking=False while TTS audio might still be in
+        # the Twilio pipe — the TTS echo would loop back through the phone
+        # line and trigger a false STT final. Only the mark handler flips
+        # the flag when all audio has confirmed as played.
+        #
+        # Exception: if NO mark was ever sent (TTS cancelled before the
+        # first sentence's mark), we can reset safely — no audio played.
+        if session.response_generation == response_generation:
+            if session.latest_mark_sent is None:
+                session.is_speaking = False
+            elif session.latest_mark_sent == session.latest_mark_confirmed:
+                session.is_speaking = False
+
+        if session.response_generation == response_generation and session.is_speaking:
+
+            # Capture speaking_chunks at timeout creation. A new turn resets
+            # speaking_chunks to 0, so detecting a LOWER value means the old
+            # timeout is stale and must not cancel the active turn.
+            _guard_speaking_chunks = session.speaking_chunks
+
+            async def _mark_timeout() -> None:
+                await asyncio.sleep(5.0)
+                if not session.is_speaking or session.stopped:
+                    return
+                if session.speaking_chunks < _guard_speaking_chunks:
+                    return  # Reset detected — new turn in progress
+                logger.warning(
+                    "Mark timeout — force is_speaking=False [%s]",
+                    session.call_sid,
+                )
+                session.is_speaking = False
+
+            asyncio.create_task(_mark_timeout())
+
+        # Persist the Groq messages list for next turn's fast path
+        if session.response_generation == response_generation:
+            session.groq_messages = payload.groq_messages
+
+        if spoken_response_parts:
+            response_text = " ".join(part.strip() for part in spoken_response_parts if part.strip()).strip()
+            session.add_assistant_turn(response_text)
+            # Append assistant response to the persisted message list
+            # so the next turn includes full conversation context
+            if session.groq_messages is not None:
+                session.groq_messages.append({"role": "assistant", "content": response_text})
+
+        if session.pending_user_transcript_norm == normalized_text:
+            session.pending_user_transcript_norm = ""
 
 
 def _append_transcript_if_new(session: SessionState, text: str) -> bool:
@@ -476,7 +622,9 @@ async def _stream_sentence_to_twilio(
 
 
 async def _cancel_tts(websocket: WebSocket, session: SessionState) -> None:
-    """Cancel active TTS + tell Twilio to discard buffered audio."""
+    """Cancel active TTS + flush buffered audio + tell Twilio to discard buffered audio."""
+    session.response_generation += 1
+
     if session.current_tts_cancel:
         try:
             session.current_tts_cancel()
@@ -484,8 +632,27 @@ async def _cancel_tts(websocket: WebSocket, session: SessionState) -> None:
             pass
         session.current_tts_cancel = None
 
+    # Flush buffered audio to STT before re-enabling push.
+    # This preserves the first ~200ms of the user's interruption.
+    if session.stt_recognizer and session.stt_audio_buffer:
+        for chunk in session.stt_audio_buffer:
+            session.stt_recognizer.push(chunk)
+        logger.debug(
+            "Flushed %d buffered chunks to STT [%s]",
+            len(session.stt_audio_buffer),
+            session.call_sid,
+        )
+        session.stt_audio_buffer.clear()
+
+    session.stt_partial_text = ""
+    session.stt_silence_chunks = 0
+    session.stt_resume_after_ts = session.latest_media_timestamp + _POST_CLEAR_STT_SUPPRESS_MS
     session.is_speaking = False
+    session.tts_active = False
     session.barge_in_loud_samples = 0
+    session.speaking_chunks = 0
+    session.latest_mark_sent = None
+    session.latest_mark_confirmed = None
 
     await _ws_send(websocket, {
         "event": "clear",

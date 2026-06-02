@@ -5,7 +5,6 @@ from collections.abc import AsyncGenerator
 import azure.cognitiveservices.speech as speechsdk
 
 from app.config import get_settings
-from app.utils.audio import strip_riff_header
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -19,27 +18,20 @@ async def synthesize_sentence(
     voice: str | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Synthesize a single sentence via Azure Neural TTS.
+    Synthesize one sentence and yield Twilio-sized mulaw chunks.
 
-    Yields raw mulaw bytes in 160-byte chunks suitable for sending
-    directly to Twilio as base64-encoded media events.
-
-    Azure returns PCM16 (or RIFF-wrapped PCM16) at 8kHz mono.
-    We strip the RIFF header if present, then convert PCM16 → mulaw.
-
-    Usage:
-        async for chunk in synthesize_sentence("Hello there!", voice):
-            b64 = base64.b64encode(chunk).decode()
-            send_to_twilio(b64)
+    This deliberately uses Azure's blocking synthesis call in a worker thread.
+    The direct pull-stream approach was hanging in the live Docker container,
+    which meant Twilio never received audio completion marks and calls stalled.
+    Sentence-level chunking still gives us streamed playback because the LLM
+    hands off sentences incrementally.
     """
     voice = voice or settings.tts_default_voice
     text = text.strip()
     if not text:
         return
 
-    # Run the blocking Azure TTS call in a thread pool
-    # so we don't block the asyncio event loop
-    raw_audio = await asyncio.get_event_loop().run_in_executor(
+    raw_audio = await asyncio.get_running_loop().run_in_executor(
         None,
         _synthesize_blocking,
         text,
@@ -50,15 +42,12 @@ async def synthesize_sentence(
         logger.warning("TTS returned empty audio for: %s", text[:60])
         return
 
-    # Strip RIFF header if Azure returned a WAV container
-    raw_mulaw = strip_riff_header(raw_audio)
-
-    # Yield in Twilio-sized chunks
     total_chunks = 0
-    for i in range(0, len(raw_mulaw), _CHUNK_SIZE):
-        yield raw_mulaw[i : i + _CHUNK_SIZE]
+    for i in range(0, len(raw_audio), _CHUNK_SIZE):
+        yield raw_audio[i : i + _CHUNK_SIZE]
         total_chunks += 1
-    logger.debug("TTS yielded %d chunks for: %s", total_chunks, text[:60])
+
+    logger.debug("TTS streamed %d chunks for: %s", total_chunks, text[:60])
 
 
 def _synthesize_blocking(text: str, voice: str) -> bytes | None:
@@ -158,6 +147,6 @@ def _build_ssml(text: str, voice: str) -> str:
     )
     return (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}">{safe_text}</voice>'
+        f'<voice name="{voice}"><prosody rate="+15%">{safe_text}</prosody></voice>'
         f"</speak>"
     )

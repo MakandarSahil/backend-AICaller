@@ -64,22 +64,18 @@ class AzureSTT:
         )
         self._speech_config.speech_recognition_language = self._language
 
-        # Reduce initial silence timeout — callers don't always speak immediately
-        # but we don't want Azure to time out too fast either
         self._speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-            "5000",
+            "3000",
         )
         self._speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-            "1000",
+            "150",
         )
         if hasattr(speechsdk.PropertyId, "Speech_SegmentationSilenceTimeoutMs"):
-            # Helps continuous recognition finalize an utterance sooner after
-            # caller pause, so LLM/TTS can respond mid-call.
             self._speech_config.set_property(
                 speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-                "700",
+                "150",
             )
 
         # Push stream — PCM16 8kHz mono (Twilio's native format after mulaw decode)

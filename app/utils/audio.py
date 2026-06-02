@@ -90,18 +90,16 @@ def strip_riff_header(buf: bytes) -> bytes:
 def calculate_volume(mulaw_bytes: bytes) -> float:
     """
     Calculate the average volume of a mulaw audio chunk.
-    Used for barge-in detection.
+    Used for barge-in detection and silence endpointing.
 
-    Returns a float in range [0, 128].
-    Mulaw values of 0x7F (silence) map to ~0 volume.
-    Loud audio approaches 128.
-
-    Threshold for barge-in is typically set to ~500 on the
-    PCM16 scale — but since we're checking mulaw directly here,
-    the threshold from settings (default 500) is on the mulaw
-    deviation scale (abs(sample - 128) * 4 approximation).
+    Decodes mulaw to PCM16 internally to calculate true amplitude.
+    Returns a float representing average absolute PCM amplitude (0 to 32767).
     """
     if not mulaw_bytes:
         return 0.0
-    total = sum(abs(b - 128) for b in mulaw_bytes)
+    
+    total = 0
+    for b in mulaw_bytes:
+        total += abs(_mulaw_decode(b))
+        
     return total / len(mulaw_bytes)

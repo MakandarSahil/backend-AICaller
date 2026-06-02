@@ -6,6 +6,7 @@ from app.clients.redis import get_redis
 from app.clients.supabase import get_supabase
 from app.config import get_settings
 from app.models.session import SessionState
+from app.pipeline.prompt import build_system_prompt_block
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -210,7 +211,7 @@ async def populate_session(session: SessionState, caller_phone: str) -> None:
     Load all context into a session after it's created.
     Called once on the Twilio 'start' event.
 
-    Loads: agent_config, kb_documents, caller_id, caller_history (into kb context)
+    Loads: agent_config, kb_documents
     """
     session.caller_phone = caller_phone
 
@@ -223,18 +224,45 @@ async def populate_session(session: SessionState, caller_phone: str) -> None:
     session.agent_config = agent_config or {}
     session.kb_documents = kb_docs or []
 
-    # Resolve workspace_id from agent_config to look up caller
-    workspace_id = session.agent_config.get("workspace_id", "")
-    if workspace_id and caller_phone:
-        session.caller_id = await resolve_or_create_caller(workspace_id, caller_phone)
+    # Pre-build the static system prompt block (system + KB + caller history placeholder)
+    # This avoids rebuilding it on every LLM turn.
+    # Caller history will be appended later when available.
+    session.cached_system_prompt = build_system_prompt_block(
+        agent_config=session.agent_config,
+        kb_documents=session.kb_documents,
+        caller_history=[],  # will be updated when caller history loads
+    )
 
     logger.info(
-        "Session populated: call_sid=%s agent=%s kb_docs=%d caller_id=%s",
+        "Session populated: call_sid=%s agent=%s kb_docs=%d",
         session.call_sid,
         session.agent_id,
         len(session.kb_documents),
-        session.caller_id,
     )
+
+
+async def preload_caller_data(session: SessionState) -> None:
+    """
+    Preload caller history in the background after caller_id is resolved.
+    Updates the cached system prompt with caller history.
+    Called from the background DB setup task.
+    """
+    if session.caller_id:
+        session.caller_history = await load_caller_history(session.caller_id)
+
+        # Rebuild cached system prompt with caller history now available
+        session.cached_system_prompt = build_system_prompt_block(
+            agent_config=session.agent_config,
+            kb_documents=session.kb_documents,
+            caller_history=session.caller_history,
+        )
+
+        logger.info(
+            "Caller history preloaded: call_sid=%s caller_id=%s turns=%d",
+            session.call_sid,
+            session.caller_id,
+            len(session.caller_history),
+        )
 
 
 async def _gather_safe(*coros):

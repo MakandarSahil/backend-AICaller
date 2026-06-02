@@ -54,14 +54,17 @@ class Settings(BaseSettings):
     tts_default_voice: str = "en-IN-PrabhatNeural"
 
     # barge-in
-    barge_in_threshold: int = 500
-    barge_in_min_chunks: int = 15
+    # Threshold is on PCM16 amplitude scale (0-32767).
+    # TTS echo through phone lines typically measures 1000-3000.
+    # Set above this range so only real user speech (>5000) triggers barge-in.
+    barge_in_threshold: int = 5000
+    barge_in_min_chunks: int = 5
 
     # Caching (Redis TTLs in seconds)
-    cache_ttl_agent: int = 300             # 5 min — agent config + KB
-    cache_ttl_kb: int = 300               # 5 min
-    cache_ttl_caller_history: int = 1800  # 30 min
-    cache_ttl_auth: int = 300             # 5 min — API key + JWT workspace lookups
+    cache_ttl_agent: int = 3600           # 1 hour — agent config rarely changes
+    cache_ttl_kb: int = 3600             # 1 hour
+    cache_ttl_caller_history: int = 3600  # 1 hour
+    cache_ttl_auth: int = 3600           # 1 hour — API key + JWT workspace lookups
 
     # LLM promt limits
     kb_max_chars: int = 60_000

@@ -44,6 +44,11 @@ except Exception as exc:
 logging.basicConfig(level=log_level, handlers=handlers, force=True)
 logger = logging.getLogger(__name__)
 
+# Silence noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+
 
 # ── Tag metadata — shown as section headers + descriptions in Swagger UI ───────
 _OPENAPI_TAGS = [

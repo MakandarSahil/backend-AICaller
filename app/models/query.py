@@ -84,6 +84,23 @@ class QueryPayload(BaseModel):
         description="Past conversation summaries for this caller (from Supabase)",
     )
 
+    # ── Prompt caching ────────────────────────────────────────────────────────
+    cached_system_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Pre-built system prompt cached at session start. "
+            "Avoids rebuilding the entire prompt (KB docs + caller history) on every turn."
+        ),
+    )
+    groq_messages: list[dict[str, str]] | None = Field(
+        default=None,
+        description=(
+            "Reusable Groq messages list maintained across turns in a call session. "
+            "When set, build_prompt appends the new user message instead of rebuilding "
+            "the full system + history from scratch. Avoids redundant serialization."
+        ),
+    )
+
     # ── Identifiers ──────────────────────────────────────────────────────────
     call_sid: str | None = Field(
         default=None,
