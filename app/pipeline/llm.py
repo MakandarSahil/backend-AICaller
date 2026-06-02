@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _groq_client: AsyncGroq | None = None
 
-_SENTENCE_ENDINGS = {".", "!", "?", ":", ";", ","}
+_SENTENCE_ENDINGS = {".", "!", "?"}
 _MIN_SENTENCE_LEN = 2
 _MAX_BUFFER_CHARS = 45
 

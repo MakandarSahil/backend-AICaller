@@ -10,7 +10,7 @@ from app.clients.supabase import get_supabase
 from app.config import get_settings
 from app.models.query import Channel, QueryPayload
 from app.models.session import SessionState
-from app.pipeline.llm import stream_llm_sentences
+from app.pipeline.llm import stream_llm_sentences, get_groq_client
 from app.pipeline.session import (
     create_session,
     delete_session,
@@ -28,8 +28,8 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 _VOICE_ACTIVITY_THRESHOLD = 500.0
-_PARTIAL_COMMIT_SILENCE_CHUNKS = 8  # ~160ms at 20ms Twilio media frames
-_POST_CLEAR_STT_SUPPRESS_MS = 400
+_PARTIAL_COMMIT_SILENCE_CHUNKS = 25  # ~500ms at 20ms Twilio media frames — gives Azure time for on_final
+_POST_CLEAR_STT_SUPPRESS_MS = 200
 
 
 async def handle_call(websocket: WebSocket, agent_id: str | None) -> None:
@@ -175,6 +175,11 @@ async def _handle_start(websocket: WebSocket, msg: dict, agent_id: str) -> str:
         language=_resolve_stt_language(session.agent_config),
     )
     session.stt_recognizer.start()
+
+    # Trigger the initial greeting — the agent speaks first so the caller
+    # doesn't hear silence. Runs as a background task; barge-in works
+    # naturally if the caller speaks over the greeting.
+    asyncio.create_task(_trigger_greeting(websocket, session))
 
     return call_sid
 
@@ -337,6 +342,10 @@ async def _handle_stop(call_sid: str) -> None:
             pass
         session.current_tts_cancel = None
 
+    # Mark as not speaking so any in-flight LLM/TTS loops detect the hang-up
+    session.is_speaking = False
+    session.tts_active = False
+
     await _mark_conversation_completed(session)
 
     # Fire Celery task — persist messages + summary + update conversation row
@@ -355,6 +364,140 @@ async def _handle_stop(call_sid: str) -> None:
 
     session.stopped = True
     delete_session(call_sid)
+
+
+# ── Sentence boundary helpers ─────────────────────────────────────────────────
+
+_SENTENCE_ENDINGS = {".", "!", "?"}
+_MIN_SENTENCE_LEN = 2
+_MAX_BUFFER_CHARS = 45
+
+
+def _find_sentence_boundary(text: str) -> int:
+    for i, ch in enumerate(text):
+        if ch in _SENTENCE_ENDINGS:
+            return i
+    return -1
+
+
+# ── Initial greeting ──────────────────────────────────────────────────────────
+
+async def _trigger_greeting(websocket: WebSocket, session: SessionState) -> None:
+    """
+    Generate the agent's initial greeting when a call connects.
+    Runs the LLM → TTS pipeline without waiting for user input.
+    The system prompt instructs the LLM to greet the caller.
+    Supports barge-in (user interrupts greeting).
+    """
+    if session.stopped or session.is_speaking:
+        return
+
+    gen = session.response_generation + 1
+    session.response_generation = gen
+    session.is_speaking = True
+    session.speaking_chunks = 0
+    session.barge_in_loud_samples = 0
+
+    system_prompt = session.cached_system_prompt or ""
+    greeting_messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    spoken_response_parts: list[str] = []
+    tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _greeting_tts_worker() -> None:
+        while True:
+            sentence = await tts_queue.get()
+            if sentence is None:
+                break
+            if not session.is_speaking or session.response_generation != gen:
+                break
+            was_cancelled = await _stream_sentence_to_twilio(
+                websocket, session, sentence
+            )
+            if was_cancelled or not session.is_speaking or session.response_generation != gen:
+                break
+            spoken_response_parts.append(sentence)
+
+    session.tts_active = True
+    worker = asyncio.create_task(_greeting_tts_worker())
+
+    try:
+        client = get_groq_client()
+        model = session.agent_config.get("llm_model") or settings.groq_model
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=greeting_messages,
+            max_tokens=settings.groq_max_tokens,
+            temperature=settings.groq_temperature,
+            stream=True,
+        )
+
+        buffer = ""
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+            if not session.is_speaking or session.response_generation != gen:
+                logger.info("Greeting aborted (barge-in) [%s]", session.call_sid)
+                break
+
+            buffer += delta
+
+            while True:
+                idx = _find_sentence_boundary(buffer)
+                if idx == -1:
+                    break
+                sentence = buffer[: idx + 1].strip()
+                buffer = buffer[idx + 1 :]
+                if len(sentence) >= _MIN_SENTENCE_LEN:
+                    await tts_queue.put(sentence)
+
+            if len(buffer) >= _MAX_BUFFER_CHARS:
+                flush = buffer.strip()
+                buffer = ""
+                if len(flush) >= _MIN_SENTENCE_LEN:
+                    await tts_queue.put(flush)
+
+        final = buffer.strip()
+        if len(final) >= _MIN_SENTENCE_LEN:
+            await tts_queue.put(final)
+
+    except Exception as exc:
+        logger.error("Greeting error [%s]: %s", session.call_sid, exc, exc_info=True)
+    finally:
+        await tts_queue.put(None)
+        await worker
+
+        if session.response_generation == gen:
+            session.tts_active = False
+            session.current_tts_cancel = None
+
+        if session.response_generation == gen:
+            if session.latest_mark_sent is None:
+                session.is_speaking = False
+            elif session.latest_mark_sent == session.latest_mark_confirmed:
+                session.is_speaking = False
+
+        if session.response_generation == gen and session.is_speaking:
+            _guard_speaking_chunks = session.speaking_chunks
+
+            async def _greeting_mark_timeout() -> None:
+                await asyncio.sleep(5.0)
+                if not session.is_speaking or session.stopped:
+                    return
+                if session.speaking_chunks < _guard_speaking_chunks:
+                    return
+                session.is_speaking = False
+
+            asyncio.create_task(_greeting_mark_timeout())
+
+        if spoken_response_parts:
+            response_text = " ".join(part.strip() for part in spoken_response_parts if part.strip()).strip()
+            session.add_assistant_turn(response_text)
+
+        logger.info("Greeting complete [%s]: %s", session.call_sid, spoken_response_parts)
 
 
 # ── LLM → TTS pipeline ────────────────────────────────────────────────────────
@@ -393,8 +536,20 @@ async def _handle_final_transcript(
         logger.debug("Ignoring transcript while speaking [%s]: %s", session.call_sid, text)
         return
 
-    if session.pending_user_transcript_norm == normalized_text:
-        logger.debug("Duplicate transcript already pending [%s]: %s", session.call_sid, text)
+    if (
+        session.pending_user_transcript_norm
+        and (
+            normalized_text == session.pending_user_transcript_norm
+            or normalized_text.startswith(session.pending_user_transcript_norm)
+            or session.pending_user_transcript_norm.startswith(normalized_text)
+        )
+    ):
+        logger.debug(
+            "Duplicate transcript (overlap) [%s]: pending=%r new=%r",
+            session.call_sid,
+            session.pending_user_transcript_norm,
+            normalized_text,
+        )
         return
 
     if not _append_transcript_if_new(session, text):
